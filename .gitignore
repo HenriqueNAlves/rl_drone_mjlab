@@ -1,0 +1,30 @@
+# Logs & runs
+logs/
+wandb/
+outputs/
+runs/
+*.tfevents.*
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+tb_env/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

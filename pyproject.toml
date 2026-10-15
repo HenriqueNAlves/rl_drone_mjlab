@@ -1,0 +1,8 @@
+[project]
+name = "new-mjlab"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["mjlab"]
+
+[tool.uv.sources]
+mjlab = { path = "/home/kique/mjlab", editable = true }
