@@ -71,7 +71,8 @@ _MAX_TILT_RAD = math.radians(90.0)
 # The alive term is what makes surviving better than terminating; keep it
 # >= the spawn distance (2.83 m) or a surviving step goes net-negative.
 _REWARD_DISTANCE = 1.0
-_REWARD_SPEED = 0.1
+_REWARD_SPEED = 0.02
+_REWARD_CLOSING = 0.5
 _REWARD_RATE = 0.01
 _REWARD_ALIVE = 3.0
 
@@ -213,6 +214,22 @@ def speed_penalty(
   asset: Entity = env.scene[asset_cfg.name]
   speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
   return -torch.clamp(speed, max=20.0)
+
+
+def closing_speed(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DRONE_CFG,
+) -> torch.Tensor:
+  """Velocity component pointing at the target: positive when closing in.
+
+  Rewards flying *toward* the goal (and so a straight approach), rather
+  than merely being close to it.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  to_goal = _target_tensor(asset) - asset.data.root_link_pos_w
+  direction = to_goal / torch.norm(to_goal, dim=-1, keepdim=True).clamp_min(1e-6)
+  closing = (asset.data.root_link_lin_vel_w * direction).sum(dim=-1)
+  return torch.clamp(closing, -10.0, 10.0)
 
 
 def alive_bonus(
@@ -421,6 +438,7 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
       func=distance_penalty, weight=_REWARD_DISTANCE
     ),
     "speed": RewardTermCfg(func=speed_penalty, weight=_REWARD_SPEED),
+    "closing": RewardTermCfg(func=closing_speed, weight=_REWARD_CLOSING),
     "rate": RewardTermCfg(func=rate_penalty, weight=_REWARD_RATE),
     "alive": RewardTermCfg(func=alive_bonus, weight=_REWARD_ALIVE),
     "crash": RewardTermCfg(func=crash_penalty, weight=_PENALTY_CRASH),
@@ -501,14 +519,14 @@ def drone_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       num_mini_batches=4,
       learning_rate=5.0e-4,
       schedule="adaptive",
-      gamma=0.99,
+      gamma=0.995,
       lam=0.95,
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
     experiment_name="drone_hover",
     save_interval=50,
-    num_steps_per_env=32,
+    num_steps_per_env=64,
     max_iterations=500,
     logger="tensorboard",
   )
