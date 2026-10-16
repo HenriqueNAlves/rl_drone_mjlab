@@ -5,9 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import math
+
 import mujoco
 import torch
-import math
 
 from mjlab.actuator.actuator import TransmissionType
 from mjlab.actuator.xml_actuator import XmlActuatorCfg
@@ -23,7 +24,6 @@ from mjlab.managers.observation_manager import (
   ObservationGroupCfg,
   ObservationTermCfg,
 )
-from mjlab.utils.lab_api.math import quat_error_magnitude, quat_from_euler_xyz
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
@@ -57,39 +57,46 @@ _SITE_NAMES = ("rotor_fl", "rotor_fr", "rotor_rl", "rotor_rr")
 _MIN_HEIGHT = 0.05
 _MAX_POS_XY = 10.0
 _MAX_VEL = 20.0
-_MAX_TILT_COS = math.cos(math.radians(45))
 
+# Episode duration in seconds. After this, the episode ends — no reward,
+# no penalty, just a restart.
+_EPISODE_LENGTH_S = 10.0
+
+# Safety net: terminate once the drone tilts past this angle from upright,
+# so an inverted, unrecoverable drone doesn't spin out of control.
+_MAX_TILT_RAD = math.radians(90.0)
+
+# --- Reward weights -------------------------------------------------------
+# Negative shaping (closer / slower is better) plus a positive alive bonus.
+# The alive term is what makes surviving better than terminating; keep it
+# >= the spawn distance (2.83 m) or a surviving step goes net-negative.
 _REWARD_DISTANCE = 1.0
 _REWARD_SPEED = 0.1
 _REWARD_RATE = 0.01
-_REWARD_ALIVE = 0.0
-_REWARD_HEIGHT = 2.0        # Gaussian reward for staying near target z
-_PENALTY_LOW_HEIGHT = 5.0   # Per-step penalty when below safe height
-_PENALTY_CRASH = 200.0      # Contact-based crash penalty (dt-scaled → ~4 effective)
+_REWARD_ALIVE = 3.0
+
+_PENALTY_CRASH = 150.0
 _PENALTY_TILT = 150.0
-_REWARD_SUCCESS = 5000.0     # Very large bonus for success
-_REWARD_GOAL = 20.0          # Hover reward at target
-_REWARD_ANGLE = 100.0        # Strong angle reward during approach (position-gated)
-_REWARD_APPROACH = 10.0      # Approach reward (pitch while flying toward target)
+_PENALTY_RUNAWAY = 150.0
+_PENALTY_TIMEOUT = 60.0
+# Terminal bonus for reaching the goal. As a one-shot it must beat what the
+# drone could earn by surviving just *outside* the tolerance for a whole
+# episode (~+54 at dt=0.02), or it learns to loiter there instead of finishing.
+# One-shot value = weight * dt, so keep the weight above ~2200.
+_REWARD_SUCCESS = 5000.0
 
-_SAFE_HEIGHT = 0.3          # Height below which penalty applies
-_TARGET_Z = 1.0             # Target hover height
-_HEIGHT_STD = 0.3           # Gaussian std for height reward
-_ANGLE_STD = math.radians(15)  # Gaussian std for angle reward (15 deg)
-
-_SUCCESS_POS_TOL = 0.25      # Position tolerance for success (m)
-_SUCCESS_VEL_TOL = 0.25      # Velocity tolerance for success (m/s)
-_SUCCESS_ANG_TOL = math.radians(2)  # Angle tolerance for success (2 deg)
-
-# Target orientation for tilted platform landing (40 deg pitch, 0 roll, 0 yaw)
-# Note: quat_from_euler_xyz returns [4], we'll expand to [1, 4] in functions
-_TARGET_EULER = (0.0, math.radians(40), 0.0)
+# Success tolerances (used by both the `success` reward and termination)
+_SUCCESS_POS_TOL = 0.25     # m
+_SUCCESS_VEL_TOL = 0.15     # m/s
 
 
 # ---------------------------------------------------------------------------
 # Sensors
 # ---------------------------------------------------------------------------
 
+# NOTE: the ground geom is created by MJLab's TerrainEntityCfg and is
+# named "terrain" (see terrains/terrain_entity.py). Keep this pattern in
+# sync if the terrain type changes.
 _DRONE_GROUND_CONTACT_CFG = ContactSensorCfg(
   name="drone_ground_contact",
   primary=ContactMatch(mode="geom", pattern="drone_geom", entity="drone"),
@@ -137,6 +144,18 @@ def _get_drone_cfg() -> EntityCfg:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _target_tensor(asset: Entity) -> torch.Tensor:
+  return torch.tensor(
+    _TARGET,
+    device=asset.data.root_link_pos_w.device,
+    dtype=asset.data.root_link_pos_w.dtype,
+  )
+
+
+# ---------------------------------------------------------------------------
 # Observations
 # ---------------------------------------------------------------------------
 
@@ -145,12 +164,9 @@ def drone_rel_pos(
   asset_cfg: SceneEntityCfg = _DRONE_CFG,
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
-  target = torch.tensor(
-    _TARGET,
-    device=asset.data.root_link_pos_w.device,
-    dtype=asset.data.root_link_pos_w.dtype,
+  return torch.clamp(
+    asset.data.root_link_pos_w - _target_tensor(asset), -5.0, 5.0
   )
-  return torch.clamp(asset.data.root_link_pos_w - target, -5.0, 5.0)
 
 
 def drone_lin_vel(
@@ -177,14 +193,17 @@ def distance_penalty(
   env: ManagerBasedRlEnv,
   asset_cfg: SceneEntityCfg = _DRONE_CFG,
 ) -> torch.Tensor:
+  """-distance to the target: a straight line, closer is better.
+
+  Clamped at ``_REWARD_ALIVE`` so that ``alive + distance`` is never
+  negative: there is no reachable state where ending the episode beats
+  surviving.
+  """
   asset: Entity = env.scene[asset_cfg.name]
-  target = torch.tensor(
-    _TARGET,
-    device=asset.data.root_link_pos_w.device,
-    dtype=asset.data.root_link_pos_w.dtype,
+  dist = torch.norm(
+    asset.data.root_link_pos_w - _target_tensor(asset), dim=-1
   )
-  dist = torch.norm(asset.data.root_link_pos_w - target, dim=-1)
-  return -dist
+  return -torch.clamp(dist, max=_REWARD_ALIVE)
 
 
 def speed_penalty(
@@ -193,7 +212,71 @@ def speed_penalty(
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
-  return -speed
+  return -torch.clamp(speed, max=20.0)
+
+
+def alive_bonus(
+  env: ManagerBasedRlEnv,
+  minimum_height: float = _MIN_HEIGHT,
+  asset_cfg: SceneEntityCfg = _DRONE_CFG,
+) -> torch.Tensor:
+  """+1 while the drone stays above the minimum height."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return (asset.data.root_link_pos_w[:, 2] > minimum_height).float()
+
+
+def crash_penalty(
+  env: ManagerBasedRlEnv,
+  sensor_name: str = "drone_ground_contact",
+) -> torch.Tensor:
+  """-1 on the step the drone contacts the ground.
+
+  Reads the same contact sensor as the ``ground_collision`` termination,
+  so the penalty and the reset fire on the same event.
+  """
+  sensor: ContactSensor = env.scene.sensors[sensor_name]
+  data = sensor.data
+  if data.force is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  force_mag = torch.norm(data.force, dim=-1)
+  return -(force_mag > 1.0).any(dim=-1).float()
+
+
+def tilt_penalty(
+  env: ManagerBasedRlEnv,
+  max_tilt: float = _MAX_TILT_RAD,
+  asset_cfg: SceneEntityCfg = _DRONE_CFG,
+) -> torch.Tensor:
+  """-1 on the step the drone tips past the tilt limit.
+
+  Mirrors the ``tilted_over`` termination so the penalty and the reset
+  fire on the same event.
+  """
+  return -tilted_over(env, max_tilt=max_tilt, asset_cfg=asset_cfg).float()
+
+
+def runaway_penalty(
+  env: ManagerBasedRlEnv,
+  max_xy: float = _MAX_POS_XY,
+  max_vel: float = _MAX_VEL,
+  asset_cfg: SceneEntityCfg = _DRONE_CFG,
+) -> torch.Tensor:
+  """-1 on the step the drone flies out of bounds.
+
+  Mirrors the ``runaway`` termination so the penalty and the reset fire
+  on the same event.
+  """
+  return -runaway(env, max_xy=max_xy, max_vel=max_vel, asset_cfg=asset_cfg).float()
+
+
+def timeout_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """-1 on the final step of an episode that reached the time limit.
+
+  Mirrors the ``time_out`` termination. This is the mildest penalty:
+  every other early exit (crash / tilt / runaway) costs more, so it only
+  nudges the policy toward reaching the goal rather than merely surviving.
+  """
+  return -(env.episode_length_buf >= env.max_episode_length).float()
 
 
 def rate_penalty(
@@ -202,205 +285,56 @@ def rate_penalty(
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   rate = torch.norm(asset.data.root_link_ang_vel_w, dim=-1)
-  return -rate
+  return -torch.clamp(rate, max=20.0)
 
 
-def alive_bonus(
-  env: ManagerBasedRlEnv,
-  minimum_height: float = _MIN_HEIGHT,
-  asset_cfg: SceneEntityCfg = _DRONE_CFG,
-) -> torch.Tensor:
-  asset: Entity = env.scene[asset_cfg.name]
-  return (asset.data.root_link_pos_w[:, 2] > minimum_height).float()
-
-
-def height_reward(
-  env: ManagerBasedRlEnv,
-  target_z: float = _TARGET_Z,
-  std: float = _HEIGHT_STD,
-  asset_cfg: SceneEntityCfg = _DRONE_CFG,
-) -> torch.Tensor:
-  """Gaussian reward for staying near target height."""
-  asset: Entity = env.scene[asset_cfg.name]
-  z = asset.data.root_link_pos_w[:, 2]
-  return torch.exp(-0.5 * ((z - target_z) / std) ** 2)
-
-
-def low_height_penalty(
-  env: ManagerBasedRlEnv,
-  safe_height: float = _SAFE_HEIGHT,
-  asset_cfg: SceneEntityCfg = _DRONE_CFG,
-) -> torch.Tensor:
-  """Linear penalty per step when below safe height."""
-  asset: Entity = env.scene[asset_cfg.name]
-  z = asset.data.root_link_pos_w[:, 2]
-  below = torch.clamp(safe_height - z, min=0.0)
-  return -below / safe_height  # -1 at ground, 0 at safe_height
-
-
-def crash_penalty(
-  env: ManagerBasedRlEnv,
-  sensor_name: str = "drone_ground_contact",
-  force_threshold: float = 1.0,
-) -> torch.Tensor:
-  """Penalty when contact sensor detects significant ground impact."""
-  sensor: ContactSensor = env.scene.sensors[sensor_name]
-  data = sensor.data
-  if data.force is None:
-    return torch.zeros(env.num_envs, device=env.device, dtype=torch.float)
-  force_mag = torch.norm(data.force, dim=-1)  # [B, N]
-  return -(force_mag > force_threshold).any(dim=-1).float()
-
-
-def tilt_penalty(
-  env: ManagerBasedRlEnv,
-  max_tilt_cos: float = _MAX_TILT_COS,
-  asset_cfg: SceneEntityCfg = _DRONE_CFG,
-) -> torch.Tensor:
-  """-1 on the step the drone tips past the tilt threshold."""
-  asset: Entity = env.scene[asset_cfg.name]
-  gz = asset.data.projected_gravity_b[:, 2]
-  return -(gz > max_tilt_cos).float()
-
-
-def _get_target_quat(device, dtype, batch_size=1) -> torch.Tensor:
-  """Create target quaternion on the correct device with batch dimension."""
-  return quat_from_euler_xyz(
-    torch.tensor(_TARGET_EULER[0], device=device, dtype=dtype),
-    torch.tensor(_TARGET_EULER[1], device=device, dtype=dtype),
-    torch.tensor(_TARGET_EULER[2], device=device, dtype=dtype),
-  ).unsqueeze(0).expand(batch_size, 4)
-
-
-def success_termination(
+def _at_goal(
   env: ManagerBasedRlEnv,
   pos_tol: float = _SUCCESS_POS_TOL,
   vel_tol: float = _SUCCESS_VEL_TOL,
-  ang_tol: float = _SUCCESS_ANG_TOL,
   asset_cfg: SceneEntityCfg = _DRONE_CFG,
 ) -> torch.Tensor:
-  """Terminate when drone reaches target position, velocity, and orientation."""
+  """True where the drone is within ``pos_tol`` of the target and slower
+  than ``vel_tol``. Shared by the ``success`` reward and termination so
+  both fire on the same step."""
   asset: Entity = env.scene[asset_cfg.name]
-  device = asset.data.root_link_pos_w.device
-  dtype = asset.data.root_link_pos_w.dtype
-  n_envs = asset.data.root_link_pos_w.shape[0]
-  
-  target = torch.tensor(_TARGET, device=device, dtype=dtype)
-  target_quat = _get_target_quat(device, dtype, n_envs)
-  
-  pos_err = torch.norm(asset.data.root_link_pos_w - target, dim=-1)
+  pos_err = torch.norm(
+    asset.data.root_link_pos_w - _target_tensor(asset), dim=-1
+  )
   speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
-  ang_err = quat_error_magnitude(asset.data.root_link_quat_w, target_quat)
-  return (pos_err < pos_tol) & (speed < vel_tol) & (ang_err < ang_tol)
+  return (pos_err < pos_tol) & (speed < vel_tol)
 
 
 def success_bonus(
   env: ManagerBasedRlEnv,
   pos_tol: float = _SUCCESS_POS_TOL,
   vel_tol: float = _SUCCESS_VEL_TOL,
-  ang_tol: float = _SUCCESS_ANG_TOL,
   asset_cfg: SceneEntityCfg = _DRONE_CFG,
 ) -> torch.Tensor:
-  """Bonus reward for reaching target with low velocity and correct orientation."""
-  asset: Entity = env.scene[asset_cfg.name]
-  device = asset.data.root_link_pos_w.device
-  dtype = asset.data.root_link_pos_w.dtype
-  n_envs = asset.data.root_link_pos_w.shape[0]
-  
-  target = torch.tensor(_TARGET, device=device, dtype=dtype)
-  target_quat = _get_target_quat(device, dtype, n_envs)
-  
-  pos_err = torch.norm(asset.data.root_link_pos_w - target, dim=-1)
-  speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
-  ang_err = quat_error_magnitude(asset.data.root_link_quat_w, target_quat)
-  return ((pos_err < pos_tol) & (speed < vel_tol) & (ang_err < ang_tol)).float()
+  """+1 on the step the drone reaches the target and stops.
 
-
-def goal_reward(
-  env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg = _DRONE_CFG,
-) -> torch.Tensor:
-  """Hover reward at target: position + velocity + orientation all good."""
-  asset: Entity = env.scene[asset_cfg.name]
-  device = asset.data.root_link_pos_w.device
-  dtype = asset.data.root_link_pos_w.dtype
-  n_envs = asset.data.root_link_pos_w.shape[0]
-  
-  target = torch.tensor(_TARGET, device=device, dtype=dtype)
-  target_quat = _get_target_quat(device, dtype, n_envs)
-  
-  pos_err = torch.norm(asset.data.root_link_pos_w - target, dim=-1)
-  speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
-  ang_err = quat_error_magnitude(asset.data.root_link_quat_w, target_quat)
-  
-  # Tight tolerances for hover at target
-  pos_reward = torch.exp(-0.5 * (pos_err / 0.3) ** 2)
-  vel_reward = torch.exp(-0.5 * (speed / 0.3) ** 2)
-  ang_reward = torch.exp(-0.5 * (ang_err / math.radians(5)) ** 2)
-  
-  return pos_reward * vel_reward * ang_reward
-
-
-def angle_error_reward(
-  env: ManagerBasedRlEnv,
-  std: float = _ANGLE_STD,
-  pos_gate: float = 2.5,
-  asset_cfg: SceneEntityCfg = _DRONE_CFG,
-) -> torch.Tensor:
-  """Strong angle reward during approach (position-gated, wider tolerance)."""
-  asset: Entity = env.scene[asset_cfg.name]
-  device = asset.data.root_link_pos_w.device
-  dtype = asset.data.root_link_pos_w.dtype
-  n_envs = asset.data.root_link_pos_w.shape[0]
-  
-  target = torch.tensor(_TARGET, device=device, dtype=dtype)
-  target_quat = _get_target_quat(device, dtype, n_envs)
-  
-  pos_err = torch.norm(asset.data.root_link_pos_w - target, dim=-1)
-  ang_err = quat_error_magnitude(asset.data.root_link_quat_w, target_quat)
-  
-  gate = (pos_err < pos_gate).float()
-  return gate * torch.exp(-0.5 * (ang_err / math.radians(15)) ** 2)
-
-
-def approach_reward(
-  env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg = _DRONE_CFG,
-) -> torch.Tensor:
-  """Reward for moving toward target with correct pitch during approach."""
-  asset: Entity = env.scene[asset_cfg.name]
-  device = asset.data.root_link_pos_w.device
-  dtype = asset.data.root_link_pos_w.dtype
-  n_envs = asset.data.root_link_pos_w.shape[0]
-  
-  target = torch.tensor(_TARGET, device=device, dtype=dtype)
-  target_quat = _get_target_quat(device, dtype, n_envs)
-  
-  to_target = target - asset.data.root_link_pos_w
-  to_target_xy = to_target[:, :2]
-  target_dist_xy = torch.norm(to_target_xy, dim=-1)
-  target_dir_xy = to_target_xy / (target_dist_xy.unsqueeze(-1) + 1e-6)
-  
-  vel_xy = asset.data.root_link_lin_vel_w[:, :2]
-  vel_mag_xy = torch.norm(vel_xy, dim=-1)
-  vel_dir_xy = vel_xy / (vel_mag_xy.unsqueeze(-1) + 1e-6)
-  
-  ang_err = quat_error_magnitude(asset.data.root_link_quat_w, target_quat)
-  angle_good = torch.exp(-0.5 * (ang_err / math.radians(20)) ** 2)
-  
-  alignment = (vel_dir_xy * target_dir_xy).sum(dim=-1)
-  alignment = torch.clamp(alignment, -1.0, 1.0)
-  vel_toward = torch.clamp(alignment, 0.0, 1.0)
-  
-  moving = (vel_mag_xy > 0.2).float()
-  not_at_target = (target_dist_xy > 0.8).float()
-  
-  return angle_good * vel_toward * moving * not_at_target
+  Terminal bonus: the matching ``success`` termination ends the episode
+  on the same step.
+  """
+  return _at_goal(env, pos_tol, vel_tol, asset_cfg).float()
 
 
 # ---------------------------------------------------------------------------
 # Terminations
 # ---------------------------------------------------------------------------
+
+def drone_ground_collision(
+  env: ManagerBasedRlEnv,
+  sensor_name: str = "drone_ground_contact",
+) -> torch.Tensor:
+  """Terminate when the drone contacts the ground with significant force."""
+  sensor: ContactSensor = env.scene.sensors[sensor_name]
+  data = sensor.data
+  if data.force is None:
+    return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+  force_mag = torch.norm(data.force, dim=-1)
+  return (force_mag > 1.0).any(dim=-1)
+
 
 def runaway(
   env: ManagerBasedRlEnv,
@@ -418,26 +352,34 @@ def runaway(
 
 def tilted_over(
   env: ManagerBasedRlEnv,
-  max_tilt_cos: float = _MAX_TILT_COS,
+  max_tilt: float = _MAX_TILT_RAD,
   asset_cfg: SceneEntityCfg = _DRONE_CFG,
 ) -> torch.Tensor:
+  """Safety net: terminate once the drone tilts past `max_tilt` from
+  upright, so an inverted, unrecoverable drone doesn't spin out of
+  control."""
   asset: Entity = env.scene[asset_cfg.name]
-  gz = asset.data.projected_gravity_b[:, 2]
-  return gz > max_tilt_cos
+  q = asset.data.root_link_quat_w                      # (N, 4) (w, x, y, z)
+  x, y = q[:, 1], q[:, 2]
+
+  # World-frame z component of the body's local +Z axis:
+  # R[2, 2] = 1 - 2*(x*x + y*y), which equals cos(tilt from upright).
+  up_z = 1.0 - 2.0 * (x * x + y * y)
+  return up_z < math.cos(max_tilt)
 
 
-def drone_ground_collision(
+def success(
   env: ManagerBasedRlEnv,
-  sensor_name: str = "drone_ground_contact",
-  force_threshold: float = 1.0,
+  pos_tol: float = _SUCCESS_POS_TOL,
+  vel_tol: float = _SUCCESS_VEL_TOL,
+  asset_cfg: SceneEntityCfg = _DRONE_CFG,
 ) -> torch.Tensor:
-  """Terminate when the drone contacts the ground with significant force."""
-  sensor: ContactSensor = env.scene.sensors[sensor_name]
-  data = sensor.data
-  if data.force is None:
-    return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-  force_mag = torch.norm(data.force, dim=-1)  # [B, N]
-  return (force_mag > force_threshold).any(dim=-1)
+  """Terminate once the drone reaches the target and stops.
+
+  Goal reached — a true terminal state (not a time-out), so the value is
+  not bootstrapped past it.
+  """
+  return _at_goal(env, pos_tol, vel_tol, asset_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -475,18 +417,17 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
   }
 
   rewards = {
-    "distance": RewardTermCfg(func=distance_penalty, weight=_REWARD_DISTANCE),
+    "distance": RewardTermCfg(
+      func=distance_penalty, weight=_REWARD_DISTANCE
+    ),
     "speed": RewardTermCfg(func=speed_penalty, weight=_REWARD_SPEED),
     "rate": RewardTermCfg(func=rate_penalty, weight=_REWARD_RATE),
     "alive": RewardTermCfg(func=alive_bonus, weight=_REWARD_ALIVE),
-    "height": RewardTermCfg(func=height_reward, weight=_REWARD_HEIGHT),
-    "low_height": RewardTermCfg(func=low_height_penalty, weight=_PENALTY_LOW_HEIGHT),
     "crash": RewardTermCfg(func=crash_penalty, weight=_PENALTY_CRASH),
     "tilt": RewardTermCfg(func=tilt_penalty, weight=_PENALTY_TILT),
+    "runaway": RewardTermCfg(func=runaway_penalty, weight=_PENALTY_RUNAWAY),
+    "timeout": RewardTermCfg(func=timeout_penalty, weight=_PENALTY_TIMEOUT),
     "success": RewardTermCfg(func=success_bonus, weight=_REWARD_SUCCESS),
-    "goal": RewardTermCfg(func=goal_reward, weight=20.0),
-    "angle": RewardTermCfg(func=angle_error_reward, weight=_REWARD_ANGLE),
-    "approach": RewardTermCfg(func=approach_reward, weight=_REWARD_APPROACH),
   }
 
   terminations = {
@@ -494,7 +435,7 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
     "ground_collision": TerminationTermCfg(func=drone_ground_collision),
     "runaway": TerminationTermCfg(func=runaway),
     "tilted_over": TerminationTermCfg(func=tilted_over),
-    "success": TerminationTermCfg(func=success_termination),
+    "success": TerminationTermCfg(func=success),
   }
 
   return ManagerBasedRlEnvCfg(
@@ -522,7 +463,7 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
       mujoco=MujocoCfg(timestep=0.002),
     ),
     decimation=10,
-    episode_length_s=20.0,
+    episode_length_s=_EPISODE_LENGTH_S,
   )
 
 
