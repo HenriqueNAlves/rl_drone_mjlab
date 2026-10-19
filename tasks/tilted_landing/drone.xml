@@ -1,0 +1,34 @@
+<mujoco model="drone">
+  <compiler angle="radian" autolimits="true"/>
+
+  <option timestep="0.002" integrator="implicitfast"/>
+
+  <worldbody>
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+
+    <body name="drone" pos="0 0 1.0">
+      <freejoint name="root"/>
+      <inertial pos="0 0 0" mass="0.16" diaginertia="0.005 0.005 0.01"/>
+
+      <geom name="drone_geom" type="box" size="0.065 0.065 0.04" rgba="0.2 0.6 0.9 1"/>
+
+      <site name="rotor_fl" pos="0.065 0.065 0"/>
+      <site name="rotor_fr" pos="0.065 -0.065 0"/>
+      <site name="rotor_rl" pos="-0.065 0.065 0"/>
+      <site name="rotor_rr" pos="-0.065 -0.065 0"/>
+    </body>
+
+    <body name="target_marker" pos="0 0 1.0">
+      <geom type="sphere" size="0.15"
+            rgba="0.1 0.9 0.2 0.5"
+            contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="thrust_fl" site="rotor_fl" gear="0 0 1 0 0 0" ctrlrange="0 0.88"/>
+    <motor name="thrust_fr" site="rotor_fr" gear="0 0 1 0 0 0" ctrlrange="0 0.88"/>
+    <motor name="thrust_rl" site="rotor_rl" gear="0 0 1 0 0 0" ctrlrange="0 0.88"/>
+    <motor name="thrust_rr" site="rotor_rr" gear="0 0 1 0 0 0" ctrlrange="0 0.88"/>
+  </actuator>
+</mujoco>
