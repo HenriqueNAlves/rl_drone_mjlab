@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 DEFAULT_TASK = "Drone-TiltedLanding"
-DEFAULT_ITERATIONS = 1000
+DEFAULT_ITERATIONS = 500
 DEFAULT_ENVS = 256
 DEFAULT_LOGGER = "tensorboard"
 

@@ -6,9 +6,14 @@
   <worldbody>
     <light pos="0 0 3" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
 
+    <!-- Inertia: identified from the flight log as I = tau_max / alpha_max,
+         with tau_max = 2 * 0.065 m * 1.04 N = 0.135 N*m and alpha_max =
+         253 rad/s^2 (roll), 90 rad/s^2 (yaw). The previous values
+         (0.005 / 0.01) implied a 0.18 m effective radius, i.e. a 500 g-class
+         quad, and made the simulated drone ~9x too sluggish. -->
     <body name="drone" pos="0 0 1.0">
       <freejoint name="root"/>
-      <inertial pos="0 0 0" mass="0.16" diaginertia="0.005 0.005 0.01"/>
+      <inertial pos="0 0 0" mass="0.16" diaginertia="0.00053 0.00053 0.0009"/>
 
       <geom name="drone_geom" type="box" size="0.065 0.065 0.04" rgba="0.2 0.6 0.9 1"/>
 
@@ -25,10 +30,16 @@
     </body>
   </worldbody>
 
+  <!-- Rotors. `ctrlrange` is the measured 1.04 N per motor, not 0.88.
+       The gear's rotational part is the reaction torque: 0.017 N*m per N of
+       thrust, with opposite signs on the diagonal pairs (fl/rr vs fr/rl) so
+       that differential thrust produces a net yaw torque instead of a
+       thrust-proportional one. Without this the model has no yaw authority
+       at all, while the real quad reaches 8.8 rad/s. -->
   <actuator>
-    <motor name="thrust_fl" site="rotor_fl" gear="0 0 1 0 0 0" ctrlrange="0 0.88"/>
-    <motor name="thrust_fr" site="rotor_fr" gear="0 0 1 0 0 0" ctrlrange="0 0.88"/>
-    <motor name="thrust_rl" site="rotor_rl" gear="0 0 1 0 0 0" ctrlrange="0 0.88"/>
-    <motor name="thrust_rr" site="rotor_rr" gear="0 0 1 0 0 0" ctrlrange="0 0.88"/>
+    <motor name="thrust_fl" site="rotor_fl" gear="0 0 1 0 0 0.017" ctrlrange="0 1.04"/>
+    <motor name="thrust_fr" site="rotor_fr" gear="0 0 1 0 0 -0.017" ctrlrange="0 1.04"/>
+    <motor name="thrust_rl" site="rotor_rl" gear="0 0 1 0 0 -0.017" ctrlrange="0 1.04"/>
+    <motor name="thrust_rr" site="rotor_rr" gear="0 0 1 0 0 0.017" ctrlrange="0 1.04"/>
   </actuator>
 </mujoco>

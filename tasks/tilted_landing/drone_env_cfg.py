@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,11 +16,14 @@ from mjlab.actuator.xml_actuator import XmlActuatorCfg
 from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import (
+  dr,
   projected_gravity,
+  reset_root_state_uniform,
   time_out,
 )
-from mjlab.envs.mdp.actions import SiteEffortActionCfg
+from mjlab.envs.mdp.actions import SiteEffortAction, SiteEffortActionCfg
 from mjlab.managers.action_manager import ActionTermCfg
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import (
   ObservationGroupCfg,
   ObservationTermCfg,
@@ -36,7 +40,7 @@ from mjlab.scene import SceneCfg
 from mjlab.sensor import ContactMatch, ContactSensor, ContactSensorCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
-from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
 from mjlab.viewer import ViewerConfig
 
 if TYPE_CHECKING:
@@ -149,6 +153,75 @@ _SUCCESS_TILT_TOL = math.radians(12.0)
 # Require the drone to actually touch the platform, not just fly through the
 # landing pose. Set False to let "at the pose, slow, tilted" count on its own.
 _SUCCESS_REQUIRE_CONTACT = True
+
+
+# ---------------------------------------------------------------------------
+# Domain randomization
+# ---------------------------------------------------------------------------
+# One block, one half-width per parameter. `_PCT` knobs are relative (0.10 =
+# +-10 % of the nominal), `_ABS` knobs are in the parameter's own unit. The
+# values below are the FULL spread; `_DR_SCALE` multiplies all of them at once.
+# Nothing outside this block is randomized.
+#
+# Randomization curriculum (manual, like the tilt ladder):
+#   0.0 -- deterministic aircraft. Nominal mass / inertia / thrust / COM, fixed
+#          spawn. The real 35 ms motor lag and 15 ms transport delay stay on,
+#          because those are physics, not uncertainty.
+#   0.5 -- half the spread below.
+#   1.0 -- the spread below.
+_DR_SCALE = 0.0
+
+# --- Stage A: propulsion / body -------------------------------------------
+_DR_MASS_PCT = 0.10        # 0.160 kg  -> 0.144 .. 0.176
+_DR_INERTIA_PCT = 0.15     # extra shape spread on top of the mass scaling
+_DR_COM_ABS = 0.003        # m, COM shift per axis (+-3 mm)
+_DR_THRUST_PCT = 0.10      # 1.04 N per motor -> 0.94 .. 1.14
+_DR_TAU_PCT = 0.40         # 35 ms -> 21 .. 49 ms
+_DR_DELAY_ABS = 0.015      # s,   15 ms -> 0 .. 30 ms
+
+# --- Stage A: initial state ------------------------------------------------
+_DR_INIT_XY_ABS = 0.10     # m
+_DR_INIT_Z_ABS = 0.05      # m
+_DR_INIT_VEL_ABS = 0.10    # m/s, per axis
+_DR_INIT_RP_ABS = math.radians(5.0)
+# Kept small on purpose: `rel_pos` is world-frame, so the policy only learns
+# its heading from the horizontal part of `target_up` (|sin(tilt)| = 0.17 at
+# 10 deg). Full +-180 deg becomes safe only once `rel_pos` is rotated into the
+# heading frame. See project_notes.md.
+_DR_INIT_YAW_ABS = math.radians(15.0)
+_DR_INIT_RATE_ABS = 0.20   # rad/s
+
+# --- Nominals -------------------------------------------------------------
+# The airframe nominals (mass, inertia, thrust per motor, yaw torque) live in
+# `drone.xml` only; duplicating them here would let the two drift apart. The
+# actuation nominals have no XML representation, so they live here.
+_NOM_TAU_S = 0.035                      # s, thrust lag from the log
+_NOM_DELAY_S = 0.015                    # s, transport delay from the log
+
+
+# ---------------------------------------------------------------------------
+# Aerodynamics (rotor drag)
+# ---------------------------------------------------------------------------
+# The drone must not be able to spin faster than `_MAX_BODY_RATE`. Clamping the
+# rate would hand that limit to the policy for free, so instead the airframe
+# gets the drag that makes the limit an *equilibrium*: the drag torque cancels
+# the peak rotor torque exactly at `_MAX_BODY_RATE`.
+#
+#   w_max = Q_peak / c   ->   c = Q_peak / w_max
+#
+# The rate is then only reachable with the rotors saturated, and it cannot be
+# exceeded: above it the drag torque exceeds anything the rotors can produce.
+#
+# Q_peak is the same on roll and pitch (square frame, 0.065 m arm on both); yaw
+# uses the rotor reaction torque instead of the arm.
+_MAX_BODY_RATE = math.radians(500.0)    # rad/s, ceiling on every body rate
+_ARM = 0.065                            # m,     mirrors drone.xml site pos
+_THRUST_MAX = 1.04                      # N,     mirrors drone.xml ctrlrange
+_YAW_COEFF = 0.017                      # N*m/N, mirrors drone.xml gear z
+
+_DAMP_ROLL = 2.0 * _ARM * _THRUST_MAX / _MAX_BODY_RATE
+_DAMP_PITCH = _DAMP_ROLL
+_DAMP_YAW = 2.0 * _YAW_COEFF * _THRUST_MAX / _MAX_BODY_RATE
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +479,208 @@ def _platform_contact(
     return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
   force_mag = torch.norm(data.force, dim=-1)
   return (force_mag > 1.0).any(dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+
+def _log_half_width(pct: float) -> float:
+  """Log-space half-width for a +-`pct` multiplicative randomization.
+
+  `dr.pseudo_inertia` scales mass by ``exp(2*alpha)`` and each principal moment
+  by ``exp(2*d)``, so a +-10 % change needs a +-0.5*ln(1.1) half-width.
+  """
+  return 0.5 * math.log1p(pct)
+
+
+@dataclass(kw_only=True)
+class DrThrustActionCfg(SiteEffortActionCfg):
+  """Site effort control with per-env thrust gain, motor lag and delay.
+
+  `SiteEffortAction` writes the policy output straight to the actuator. The
+  real chain has three extra pieces: the thrust coefficient is not known
+  exactly, the motors spool up with a first-order lag (~35 ms), and the
+  command arrives with a transport delay (~15 ms). All three need per-env
+  state, which a stateless term cannot express, so they live in this term.
+  """
+
+  dr_scale: float = _DR_SCALE
+  gain_pct: float = _DR_THRUST_PCT
+  tau_nominal_s: float = _NOM_TAU_S
+  tau_pct: float = _DR_TAU_PCT
+  delay_nominal_s: float = _NOM_DELAY_S
+  delay_abs_s: float = _DR_DELAY_ABS
+
+  def build(self, env: ManagerBasedRlEnv) -> DrThrustAction:
+    return DrThrustAction(self, env)
+
+
+class DrThrustAction(SiteEffortAction):
+  """`SiteEffortAction` plus gain, first-order lag and transport delay.
+
+  ``apply_actions`` runs once per physics substep (2 ms), which is where the
+  lag is integrated and the delay line is clocked; one policy step spans
+  ``decimation`` substeps, so the filter is resolved at 500 Hz.
+  """
+
+  cfg: DrThrustActionCfg
+
+  def __init__(self, cfg: DrThrustActionCfg, env: ManagerBasedRlEnv):
+    super().__init__(cfg=cfg, env=env)
+    self._dt = float(env.physics_dt)
+    n = self.num_envs
+
+    # Per-env actuation parameters, resampled on every episode reset.
+    self._gain = torch.ones(n, 1, device=self.device)
+    self._tau = torch.zeros(n, 1, device=self.device)
+    self._delay_steps = torch.zeros(n, 1, dtype=torch.long, device=self.device)
+
+    # Delay line. Length comes from the knob, not from the sample, so the
+    # buffer never has to be reallocated mid-episode.
+    max_delay_s = cfg.delay_nominal_s + cfg.delay_abs_s
+    self._delay_len = max(1, round(max_delay_s / self._dt) + 1)
+    self._history = torch.zeros(
+      n, self._delay_len, self.action_dim, device=self.device
+    )
+    self._cursor = 0
+
+    self._filtered = torch.zeros(n, self.action_dim, device=self.device)
+    self._damp = torch.tensor(
+      [_DAMP_ROLL, _DAMP_PITCH, _DAMP_YAW], device=self.device
+    )
+    self._sample(torch.arange(n, device=self.device))
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    super().reset(env_ids=env_ids)
+    if isinstance(env_ids, torch.Tensor):
+      ids = env_ids.to(self.device)
+    else:
+      ids = torch.arange(self.num_envs, device=self.device)
+    self._history[ids] = 0.0
+    self._filtered[ids] = 0.0
+    self._sample(ids)
+
+  def _sample(self, ids: torch.Tensor) -> None:
+    """Draw this episode's gain, time constant and delay.
+
+    `dr_scale` scales the spread only: at 0 the aircraft is deterministic but
+    still has the nominal motor lag and transport delay.
+    """
+    s = self.cfg.dr_scale
+    k = ids.numel()
+
+    u = torch.rand((k, 1), device=self.device)
+    self._gain[ids] = 1.0 + s * self.cfg.gain_pct * (2.0 * u - 1.0)
+
+    u = torch.rand((k, 1), device=self.device)
+    tau = self.cfg.tau_nominal_s * (
+      1.0 + s * self.cfg.tau_pct * (2.0 * u - 1.0)
+    )
+    self._tau[ids] = tau.clamp_min(0.0)
+
+    u = torch.rand((k, 1), device=self.device)
+    delay = self.cfg.delay_nominal_s + s * self.cfg.delay_abs_s * (2.0 * u - 1.0)
+    steps = torch.round(delay.clamp_min(0.0) / self._dt)
+    self._delay_steps[ids] = steps.clamp(max=self._delay_len - 1).long()
+
+  def apply_actions(self) -> None:
+    # Transport delay: push the command, read back the one from `delay_steps`
+    # ago. Delay 0 reads the sample written on this very call.
+    self._history[:, self._cursor] = self._processed_actions
+    idx = torch.remainder(
+      self._cursor - self._delay_steps[:, 0], self._delay_len
+    )
+    cmd = self._history[torch.arange(self.num_envs, device=self.device), idx]
+    self._cursor = (self._cursor + 1) % self._delay_len
+
+    # Thrust-coefficient uncertainty.
+    cmd = cmd * self._gain
+
+    # First-order motor lag. tau = 0 collapses to the identity (alpha = 1).
+    alpha = 1.0 - torch.exp(-self._dt / self._tau.clamp_min(1e-6))
+    self._filtered.add_(alpha * (cmd - self._filtered))
+
+    self._entity.set_site_effort_target(
+      self._filtered, site_ids=self._target_ids
+    )
+    self._apply_rotor_drag()
+
+  def _apply_rotor_drag(self) -> None:
+    """Aerodynamic torque opposing body rotation.
+
+    This is a real torque on the body (``xfrc_applied``), not a clamp: it grows
+    linearly with the body rate, so `_MAX_BODY_RATE` is the rate at which it
+    exactly cancels the maximum rotor torque. Holding 500 deg/s therefore costs
+    full saturation, and exceeding it is impossible.
+
+    ``apply_actions`` is the only hook that runs once per physics *substep*,
+    which is what the roll/pitch time constants (~34 ms) need -- a 50 Hz event
+    would badly distort them.
+    """
+    entity = self._entity
+    quat = entity.data.root_link_quat_w
+    rate_b = quat_apply_inverse(quat, entity.data.root_link_ang_vel_w)
+    torque_w = quat_apply(quat, -rate_b * self._damp)
+    entity.write_external_wrench_to_sim(
+      forces=None,
+      torques=torque_w.unsqueeze(1),
+      body_ids=[0],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Domain randomization events
+# ---------------------------------------------------------------------------
+
+
+def _dr_events() -> dict[str, EventTermCfg]:
+  """Startup / reset randomization. Empty when `_DR_SCALE` is 0."""
+  if _DR_SCALE <= 0.0:
+    return {}
+
+  half_mass = _log_half_width(_DR_SCALE * _DR_MASS_PCT)
+  half_inertia = _log_half_width(_DR_SCALE * _DR_INERTIA_PCT)
+
+  return {
+    # Mass, inertia and COM in one physically consistent draw: `alpha` is a
+    # density change (mass and inertia move together), `d` is a shape change
+    # that leaves mass alone, `t` shifts the COM.
+    "dr_body": EventTermCfg(
+      func=dr.pseudo_inertia,
+      mode="startup",
+      params={
+        "asset_cfg": SceneEntityCfg("drone", body_names=("drone",)),
+        "alpha_range": (-half_mass, half_mass),
+        "d_range": (-half_inertia, half_inertia),
+        "t_range": (-_DR_SCALE * _DR_COM_ABS, _DR_SCALE * _DR_COM_ABS),
+      },
+    ),
+    "reset_base": EventTermCfg(
+      func=reset_root_state_uniform,
+      mode="reset",
+      params={
+        "asset_cfg": _DRONE_CFG,
+        "pose_range": {
+          "x": (-_DR_SCALE * _DR_INIT_XY_ABS, _DR_SCALE * _DR_INIT_XY_ABS),
+          "y": (-_DR_SCALE * _DR_INIT_XY_ABS, _DR_SCALE * _DR_INIT_XY_ABS),
+          "z": (-_DR_SCALE * _DR_INIT_Z_ABS, _DR_SCALE * _DR_INIT_Z_ABS),
+          "roll": (-_DR_SCALE * _DR_INIT_RP_ABS, _DR_SCALE * _DR_INIT_RP_ABS),
+          "pitch": (-_DR_SCALE * _DR_INIT_RP_ABS, _DR_SCALE * _DR_INIT_RP_ABS),
+          "yaw": (-_DR_SCALE * _DR_INIT_YAW_ABS, _DR_SCALE * _DR_INIT_YAW_ABS),
+        },
+        "velocity_range": {
+          "x": (-_DR_SCALE * _DR_INIT_VEL_ABS, _DR_SCALE * _DR_INIT_VEL_ABS),
+          "y": (-_DR_SCALE * _DR_INIT_VEL_ABS, _DR_SCALE * _DR_INIT_VEL_ABS),
+          "z": (-_DR_SCALE * _DR_INIT_VEL_ABS, _DR_SCALE * _DR_INIT_VEL_ABS),
+          "roll": (-_DR_SCALE * _DR_INIT_RATE_ABS, _DR_SCALE * _DR_INIT_RATE_ABS),
+          "pitch": (-_DR_SCALE * _DR_INIT_RATE_ABS, _DR_SCALE * _DR_INIT_RATE_ABS),
+          "yaw": (-_DR_SCALE * _DR_INIT_RATE_ABS, _DR_SCALE * _DR_INIT_RATE_ABS),
+        },
+      },
+    ),
+  }
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +1043,7 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
   }
 
   actions: dict[str, ActionTermCfg] = {
-    "rotor_thrusts": SiteEffortActionCfg(
+    "rotor_thrusts": DrThrustActionCfg(
       entity_name="drone",
       actuator_names=_SITE_NAMES,
       scale=1.0,
@@ -817,7 +1092,7 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     observations=observations,
     actions=actions,
-    events={},
+    events=_dr_events(),
     rewards=rewards,
     terminations=terminations,
     viewer=ViewerConfig(
@@ -845,6 +1120,13 @@ def drone_tilted_landing_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   if play:
     cfg.episode_length_s = 1e10
     cfg.observations["actor"].enable_corruption = False
+    # Domain randomization must never leak into an evaluation: no randomized
+    # body, no randomized spawn, no randomized actuation. The nominal motor lag
+    # and transport delay stay on -- the policy is trained with them.
+    cfg.events = {}
+    action_cfg = cfg.actions["rotor_thrusts"]
+    assert isinstance(action_cfg, DrThrustActionCfg)
+    action_cfg.dr_scale = 0.0
   return cfg
 
 
