@@ -40,7 +40,11 @@ from mjlab.scene import SceneCfg
 from mjlab.sensor import ContactMatch, ContactSensor, ContactSensorCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
-from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
+from mjlab.utils.lab_api.math import (
+  quat_apply,
+  quat_apply_inverse,
+  quat_from_euler_xyz,
+)
 from mjlab.viewer import ViewerConfig
 
 if TYPE_CHECKING:
@@ -54,10 +58,12 @@ if TYPE_CHECKING:
 _DRONE_XML: Path = Path(__file__).parent / "drone.xml"
 _DRONE_CFG = SceneEntityCfg("drone")
 
-# Landing point: the centre of the tower's tilted top face. Below the spawn
-# altitude so the drone approaches *above* the tower and descends onto it,
-# instead of flying into the stack's side.
-_SPAWN = (0.0, 0.0, 1.0)
+# Nominal spawn point: above the tower top so the drone approaches from above
+# and descends onto it instead of flying into the stack's side. Its height is
+# also the mean of the randomized spawn height (see `_SPAWN_HEIGHT_ABS`), and
+# its bearing feeds `_APPROACH_YAW`, so x/y must stay on the 45 deg diagonal.
+_SPAWN_HEIGHT = 0.5                                 # m, mean spawn altitude
+_SPAWN = (0.0, 0.0, _SPAWN_HEIGHT)
 
 # --- Tower geometry -------------------------------------------------------
 # Three loose boxes stacked under the tilted platform. Declared up here because
@@ -74,7 +80,7 @@ _STACK_TOP = _BOX_COUNT * 2.0 * _BOX_HALF[2]         # 0.42 m
 _WEDGE_HALF_L = 0.138564                             # m
 
 # Curriculum: stage 1 = 10 deg, stage 2 = 20 deg, stage 3 = 30 deg.
-_TARGET_TILT_RAD = math.radians(10.0)
+_TARGET_TILT_RAD = math.radians(20.0)
 
 # Half-height of the wedge, derived so the platform's low edge stays pinned to
 # the stack top while the high edge rises by 2 * _WEDGE_HALF_H.
@@ -144,7 +150,7 @@ _REWARD_TILT = 2.0
 _TILT_GATE_RADIUS = 1.0
 
 # Success tolerances (used by both the `success` reward and termination)
-_SUCCESS_POS_TOL = 0.25     # m
+_SUCCESS_POS_TOL = 0.20     # m
 _SUCCESS_VEL_TOL = 0.15     # m/s
 # Curriculum: 12 deg on the 10 deg ramp, then 10 deg on the 20 deg ramp,
 # then 5 deg on the final 30 deg ramp. Keep it a bit looser than the ramp
@@ -197,6 +203,33 @@ _DR_INIT_RATE_ABS = 0.20   # rad/s
 # actuation nominals have no XML representation, so they live here.
 _NOM_TAU_S = 0.035                      # s, thrust lag from the log
 _NOM_DELAY_S = 0.015                    # s, transport delay from the log
+
+
+# ---------------------------------------------------------------------------
+# Spawn area
+# ---------------------------------------------------------------------------
+# The drone starts anywhere in a flat annulus around the tower, at a random
+# altitude, and has to land on it from whatever bearing it drew. This is a
+# property of the *task*, not of the aircraft, so it is deliberately not
+# scaled by `_DR_SCALE`: it must stay randomized even when the aircraft is
+# deterministic.
+#
+# The bounds are chosen against three hard limits:
+#   near -- far enough that the drone never starts on top of the stack, and
+#           never inside the 1 m tilt-gate radius where the attitude shaping
+#           begins.
+#   far  -- `runaway` fires at 10 m from the world origin and the tower sits
+#           2.83 m out, so 4 m still leaves >= 3.1 m of margin. It also keeps
+#           every spawn well inside the +-5 m `rel_pos` observation clamp.
+#   high -- one 10 s episode has to cover the whole descent from the top of
+#           this band.
+_SPAWN_DISTANCE_NEAR = 1.20                          # m, keep-out radius
+_SPAWN_DISTANCE_FAR = 4.00                           # m
+_SPAWN_HEIGHT_ABS = 0.35                             # +- m  (0.15 .. 0.85)
+_SPAWN_SPEED_ABS = 0.10                              # +- m/s, per axis
+_SPAWN_LEAN_ABS = math.radians(5.0)                  # +- rad, roll and pitch
+_SPAWN_HEADING_ABS = math.radians(15.0)              # +- rad, yaw
+_SPAWN_SPIN_ABS = 0.20                               # +- rad/s, per axis
 
 
 # ---------------------------------------------------------------------------
@@ -635,52 +668,107 @@ class DrThrustAction(SiteEffortAction):
 # ---------------------------------------------------------------------------
 
 
+def _reset_drone_around_platform(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  distance_near: float = _SPAWN_DISTANCE_NEAR,
+  distance_far: float = _SPAWN_DISTANCE_FAR,
+  height_abs: float = _SPAWN_HEIGHT_ABS,
+  speed_abs: float = _SPAWN_SPEED_ABS,
+  lean_abs: float = _SPAWN_LEAN_ABS,
+  heading_abs: float = _SPAWN_HEADING_ABS,
+  spin_abs: float = _SPAWN_SPIN_ABS,
+  asset_cfg: SceneEntityCfg = _DRONE_CFG,
+) -> None:
+  """Drop the drone at a random point in the spawn annulus."""
+  asset: Entity = env.scene[asset_cfg.name]
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device)
+  n = len(env_ids)
+  device = env.device
+
+  def symmetric(count: int, half: float) -> torch.Tensor:
+    """Uniform in [-half, half]; exactly 0.0 when `half` is 0.0."""
+    return half * (2.0 * torch.rand(count, device=device) - 1.0)
+
+  # Uniform over *area*, not over radius: taking sqrt keeps the density
+  # constant per square metre, so a far spawn is as likely as a near one. A
+  # plain uniform radius would pile the samples onto the near edge.
+  u = torch.rand(n, device=device)
+  dist = torch.sqrt(
+    distance_near**2 + u * (distance_far**2 - distance_near**2)
+  )
+  angle = 2.0 * math.pi * torch.rand(n, device=device)
+  pad_xy = torch.tensor(_TARGET[:2], device=device, dtype=torch.float32)
+  xy = pad_xy + dist.unsqueeze(-1) * torch.stack(
+    (torch.cos(angle), torch.sin(angle)), dim=-1
+  )
+  pos = torch.cat(
+    (xy, (_SPAWN[2] + symmetric(n, height_abs)).unsqueeze(-1)), dim=-1
+  )
+  # Deliberately NOT offset by env_origins. The tower is one object per world,
+  # built at world `_TARGET` by `_tower_entities()`, and every term (reward,
+  # observation, success) reads world coordinates. Adding the origin would move
+  # the spawn area to `origin + _TARGET` while the tower stays at `_TARGET`, so
+  # envs would spawn 0.4-34 m from the pad (measured) instead of around it.
+  # `env_origins` is a grid bookkeeping offset that nothing else in this scene
+  # applies.
+
+  quat = quat_from_euler_xyz(
+    symmetric(n, lean_abs), symmetric(n, lean_abs), symmetric(n, heading_abs)
+  )
+
+  asset.write_root_link_pose_to_sim(torch.cat((pos, quat), dim=-1), env_ids=env_ids)
+  vel = speed_abs * (2.0 * torch.rand(n, 3, device=device) - 1.0)
+  spin = spin_abs * (2.0 * torch.rand(n, 3, device=device) - 1.0)
+  asset.write_root_link_velocity_to_sim(
+    torch.cat((vel, spin), dim=-1), env_ids=env_ids
+  )
+
+
 def _dr_events() -> dict[str, EventTermCfg]:
-  """Startup / reset randomization. Empty when `_DR_SCALE` is 0."""
+  """Startup / reset randomization.
+
+  `reset_base` is always present: the spawn ring belongs to the task, not to
+  the aircraft, so it does not scale with `_DR_SCALE`. Everything below it is
+  empty when `_DR_SCALE` is 0.
+  """
+  events: dict[str, EventTermCfg] = {
+    "reset_base": EventTermCfg(
+      func=_reset_drone_around_platform,
+      mode="reset",
+      params={
+        "distance_near": _SPAWN_DISTANCE_NEAR,
+        "distance_far": _SPAWN_DISTANCE_FAR,
+        "height_abs": _SPAWN_HEIGHT_ABS,
+        "speed_abs": _SPAWN_SPEED_ABS,
+        "lean_abs": _SPAWN_LEAN_ABS,
+        "heading_abs": _SPAWN_HEADING_ABS,
+        "spin_abs": _SPAWN_SPIN_ABS,
+        "asset_cfg": _DRONE_CFG,
+      },
+    ),
+  }
   if _DR_SCALE <= 0.0:
-    return {}
+    return events
 
   half_mass = _log_half_width(_DR_SCALE * _DR_MASS_PCT)
   half_inertia = _log_half_width(_DR_SCALE * _DR_INERTIA_PCT)
 
-  return {
-    # Mass, inertia and COM in one physically consistent draw: `alpha` is a
-    # density change (mass and inertia move together), `d` is a shape change
-    # that leaves mass alone, `t` shifts the COM.
-    "dr_body": EventTermCfg(
-      func=dr.pseudo_inertia,
-      mode="startup",
-      params={
-        "asset_cfg": SceneEntityCfg("drone", body_names=("drone",)),
-        "alpha_range": (-half_mass, half_mass),
-        "d_range": (-half_inertia, half_inertia),
-        "t_range": (-_DR_SCALE * _DR_COM_ABS, _DR_SCALE * _DR_COM_ABS),
-      },
-    ),
-    "reset_base": EventTermCfg(
-      func=reset_root_state_uniform,
-      mode="reset",
-      params={
-        "asset_cfg": _DRONE_CFG,
-        "pose_range": {
-          "x": (-_DR_SCALE * _DR_INIT_XY_ABS, _DR_SCALE * _DR_INIT_XY_ABS),
-          "y": (-_DR_SCALE * _DR_INIT_XY_ABS, _DR_SCALE * _DR_INIT_XY_ABS),
-          "z": (-_DR_SCALE * _DR_INIT_Z_ABS, _DR_SCALE * _DR_INIT_Z_ABS),
-          "roll": (-_DR_SCALE * _DR_INIT_RP_ABS, _DR_SCALE * _DR_INIT_RP_ABS),
-          "pitch": (-_DR_SCALE * _DR_INIT_RP_ABS, _DR_SCALE * _DR_INIT_RP_ABS),
-          "yaw": (-_DR_SCALE * _DR_INIT_YAW_ABS, _DR_SCALE * _DR_INIT_YAW_ABS),
-        },
-        "velocity_range": {
-          "x": (-_DR_SCALE * _DR_INIT_VEL_ABS, _DR_SCALE * _DR_INIT_VEL_ABS),
-          "y": (-_DR_SCALE * _DR_INIT_VEL_ABS, _DR_SCALE * _DR_INIT_VEL_ABS),
-          "z": (-_DR_SCALE * _DR_INIT_VEL_ABS, _DR_SCALE * _DR_INIT_VEL_ABS),
-          "roll": (-_DR_SCALE * _DR_INIT_RATE_ABS, _DR_SCALE * _DR_INIT_RATE_ABS),
-          "pitch": (-_DR_SCALE * _DR_INIT_RATE_ABS, _DR_SCALE * _DR_INIT_RATE_ABS),
-          "yaw": (-_DR_SCALE * _DR_INIT_RATE_ABS, _DR_SCALE * _DR_INIT_RATE_ABS),
-        },
-      },
-    ),
-  }
+  # Mass, inertia and COM in one physically consistent draw: `alpha` is a
+  # density change (mass and inertia move together), `d` is a shape change
+  # that leaves mass alone, `t` shifts the COM.
+  events["dr_body"] = EventTermCfg(
+    func=dr.pseudo_inertia,
+    mode="startup",
+    params={
+      "asset_cfg": SceneEntityCfg("drone", body_names=("drone",)),
+      "alpha_range": (-half_mass, half_mass),
+      "d_range": (-half_inertia, half_inertia),
+      "t_range": (-_DR_SCALE * _DR_COM_ABS, _DR_SCALE * _DR_COM_ABS),
+    },
+  )
+  return events
 
 
 # ---------------------------------------------------------------------------
@@ -1118,12 +1206,13 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
 def drone_tilted_landing_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = _make_env_cfg()
   if play:
-    cfg.episode_length_s = 1e10
     cfg.observations["actor"].enable_corruption = False
     # Domain randomization must never leak into an evaluation: no randomized
-    # body, no randomized spawn, no randomized actuation. The nominal motor lag
-    # and transport delay stay on -- the policy is trained with them.
-    cfg.events = {}
+    # body and no randomized actuation. The nominal motor lag and transport
+    # delay stay on -- the policy is trained with them. The spawn stays
+    # randomized, because an evaluation should show the policy on fresh
+    # bearings. The episode keeps its training length (10 s).
+    cfg.events = {"reset_base": cfg.events["reset_base"]}
     action_cfg = cfg.actions["rotor_thrusts"]
     assert isinstance(action_cfg, DrThrustActionCfg)
     action_cfg.dr_scale = 0.0
