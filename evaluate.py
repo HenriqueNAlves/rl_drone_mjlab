@@ -172,6 +172,18 @@ def main():
     "--no-check", action="store_true",
     help="skip the observation-dimension preflight before launching"
   )
+  parser.add_argument(
+    "--plot", choices=("episode", "live", "none"), default="episode",
+    help="telemetry plots: when an episode ends (default), live, or none"
+  )
+  parser.add_argument(
+    "--plot-save", default=None,
+    help="write each finished episode to this directory as a PNG"
+  )
+  parser.add_argument(
+    "--plot-env", type=int, default=0,
+    help="which environment to record when playing several (default 0)"
+  )
   args = parser.parse_args()
 
   task_index = load_task_index()
@@ -310,7 +322,11 @@ def main():
   cmd = [
     sys.executable, str(find_launcher()), task_id,
     "--checkpoint_file", chosen_ckpt,
+    "--plot", args.plot,
+    "--plot-env", str(args.plot_env),
   ]
+  if args.plot_save:
+    cmd += ["--plot-save", args.plot_save]
   sys.exit(subprocess.call(cmd))
 
 

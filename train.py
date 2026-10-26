@@ -8,11 +8,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_TASK = "Drone-TiltedLanding"
+DEFAULT_TASK = "Drone-TiltedLandingArx"
 DEFAULT_ITERATIONS = 1000
 DEFAULT_ENVS = 256
 DEFAULT_LOGGER = "tensorboard"
-DEFAULT_EXPERIMENT = "drone_tilted_landing"
+DEFAULT_EXPERIMENT = "drone_tilted_landing_arx"
 LOG_ROOT = Path(__file__).resolve().parent / "logs" / "rsl_rl"
 
 

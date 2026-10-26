@@ -36,6 +36,8 @@
        that differential thrust produces a net yaw torque instead of a
        thrust-proportional one. Without this the model has no yaw authority
        at all, while the real quad reaches 8.8 rad/s. -->
+  <!-- #remove? with ARX: nothing for a motor to drive; the term writes the
+       rate onto the root and applies thrust as one wrench at the COM. -->
   <actuator>
     <motor name="thrust_fl" site="rotor_fl" gear="0 0 1 0 0 0.017" ctrlrange="0 1.04"/>
     <motor name="thrust_fr" site="rotor_fr" gear="0 0 1 0 0 -0.017" ctrlrange="0 1.04"/>

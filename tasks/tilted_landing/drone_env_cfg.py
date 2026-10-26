@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -13,7 +14,12 @@ import torch
 
 from mjlab.actuator.actuator import TransmissionType
 from mjlab.actuator.xml_actuator import XmlActuatorCfg
-from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
+from mjlab.entity import (
+  Entity,
+  EntityArticulationInfoCfg,
+  EntityCfg,
+  VariantEntityCfg,
+)
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import (
   dr,
@@ -73,21 +79,42 @@ _BOX_COUNT = 3
 _TOWER_MASS = 0.5                                    # kg, per loose piece
 _STACK_TOP = _BOX_COUNT * 2.0 * _BOX_HALF[2]         # 0.42 m
 
-# Half-length of the platform along the slope. Held fixed across curriculum
-# stages so the pad keeps its footprint and the tilt only changes its height.
-# (Pinning the height instead would stretch a shallow ramp into a 0.9 m
-# seesaw balanced on a 0.24 m box.)
+# Half-length of the platform along the slope. Identical for every tilt, so
+# the pad footprint never changes with the angle. (Pinning the height instead
+# would stretch a shallow ramp into a 0.9 m seesaw balanced on a 0.24 m box.)
 _WEDGE_HALF_L = 0.138564                             # m
+_PLATFORM_L = 2.0 * _WEDGE_HALF_L                    # m
 
-# Curriculum: stage 1 = 10 deg, stage 2 = 20 deg, stage 3 = 30 deg.
-_TARGET_TILT_RAD = math.radians(20.0)
+# Platform tilts, one per world. mjlab can give different worlds different
+# *mesh* variants of the same entity, assigned once when the simulation is
+# built: every env keeps one tilt for the whole run, and the batch covers all
+# of them in parallel, so one policy learns every slope at the same time.
+#
+# 45 deg is deliberately absent: friction is MuJoCo's default mu = 1.0 and
+# tan(45 deg) = 1.0, so at 45 deg the drone is exactly at the sliding
+# threshold and the outcome is luck, not skill.
+_PLATFORM_TILT_DEG = (0.0, 10.0, 20.0, 30.0)
+_PLATFORM_TILTS = tuple(math.radians(d) for d in _PLATFORM_TILT_DEG)
 
-# Half-height of the wedge, derived so the platform's low edge stays pinned to
-# the stack top while the high edge rises by 2 * _WEDGE_HALF_H.
-_WEDGE_HALF_H = _WEDGE_HALF_L * math.tan(_TARGET_TILT_RAD)
+# Which slope a play/eval run uses. Training spreads worlds over every tilt
+# above; a play run pins all of them to this one, so what you watch is what
+# you asked for rather than whatever world 0 happened to draw.
+_PLAY_TILT_DEG = 10.0
 
-# Platform midpoint. The wedge body pose *is* the landing pose.
-_TARGET = (2.0, 2.0, _STACK_TOP + _WEDGE_HALF_H)
+
+def _platform_rise(tilt: float) -> float:
+  """How far the platform's high edge rises above its low edge."""
+  return _WEDGE_HALF_L * math.tan(tilt)
+
+
+_PLATFORM_RISE = tuple(_platform_rise(t) for t in _PLATFORM_TILTS)
+
+# Pad centre in the horizontal plane. The height depends on the variant: the
+# wedge's low edge is pinned to the stack top, so the pad centre (the midpoint
+# of the sloped top face) sits `_STACK_TOP + _PLATFORM_THICKNESS + rise` above
+# the floor.
+_PAD_XY = (2.0, 2.0)
+_TARGET = (_PAD_XY[0], _PAD_XY[1], _STACK_TOP)
 
 # Horizontal bearing from the spawn to the target. The drone flies in along it
 # and flares (leans its top back) to brake; tilting about the perpendicular
@@ -96,13 +123,6 @@ _TARGET = (2.0, 2.0, _STACK_TOP + _WEDGE_HALF_H)
 # so its platform normal is exactly the attitude the drone has to hold.
 _APPROACH_YAW = math.atan2(_TARGET[1] - _SPAWN[1], _TARGET[0] - _SPAWN[0])
 
-# World-frame unit vector the drone's body +Z should point along: up, leaning
-# back toward the spawn. Doubles as the tower platform's normal.
-_TARGET_UP = (
-  -math.sin(_TARGET_TILT_RAD) * math.cos(_APPROACH_YAW),
-  -math.sin(_TARGET_TILT_RAD) * math.sin(_APPROACH_YAW),
-  math.cos(_TARGET_TILT_RAD),
-)
 
 _SITE_NAMES = ("rotor_fl", "rotor_fr", "rotor_rl", "rotor_rr")
 
@@ -181,6 +201,7 @@ _DR_SCALE = 0.0
 _DR_MASS_PCT = 0.10        # 0.160 kg  -> 0.144 .. 0.176
 _DR_INERTIA_PCT = 0.15     # extra shape spread on top of the mass scaling
 _DR_COM_ABS = 0.003        # m, COM shift per axis (+-3 mm)
+# #remove? with ARX: thrust is c * m * g, so the mass draw already covers it.
 _DR_THRUST_PCT = 0.10      # 1.04 N per motor -> 0.94 .. 1.14
 _DR_TAU_PCT = 0.40         # 35 ms -> 21 .. 49 ms
 _DR_DELAY_ABS = 0.015      # s,   15 ms -> 0 .. 30 ms
@@ -235,6 +256,9 @@ _SPAWN_SPIN_ABS = 0.20                               # +- rad/s, per axis
 # ---------------------------------------------------------------------------
 # Aerodynamics (rotor drag)
 # ---------------------------------------------------------------------------
+# #remove? with ARX: the filter prescribes the rate, so there is no rotor
+# torque to cancel. (`_MAX_BODY_RATE` survives as the command scale.)
+#
 # The drone must not be able to spin faster than `_MAX_BODY_RATE`. Clamping the
 # rate would hand that limit to the policy for free, so instead the airframe
 # gets the drag that makes the limit an *equilibrium*: the drag torque cancels
@@ -265,17 +289,19 @@ _DAMP_YAW = 2.0 * _YAW_COEFF * _THRUST_MAX / _MAX_BODY_RATE
 # per Entity, so each loose body is its own Entity; with no reset event they
 # reset to their stacked poses from the model default every episode.
 #
-# The wedge's sloped face is the landing platform. Its profile is a right
-# triangle whose hypotenuse is the platform: it runs from the stack top up to
-# the platform's high edge, with the platform's midpoint at `_TARGET` and a
-# normal of exactly `_TARGET_UP`.
+# The wedge's sloped face is the landing platform. Its profile is a prism whose
+# hypotenuse is the platform: it runs from the stack top up to the platform's
+# high edge, with its normal leaning back toward the spawn (the same attitude
+# the drone has to hold to land on it).
+# Every world gets one tilt from `_PLATFORM_TILT_DEG` as a mesh variant, so a
+# single run trains the whole slope range at once.
 
 # Box colours.
 _BOX_RGBA = (0.72, 0.52, 0.28, 1.0)
 _TOP_RGBA = (0.86, 0.70, 0.34, 1.0)
 
-# `_WEDGE_HALF_L` / `_WEDGE_HALF_H` / `_STACK_TOP` are derived at the top of
-# the file, next to `_TARGET_TILT_RAD`, so a curriculum stage is one constant.
+# `_WEDGE_HALF_L` / `_PLATFORM_TILT_DEG` / `_STACK_TOP` live at the top of the
+# file, so changing the slope range is one tuple.
 # The whole tower is built in a flat local frame and yawed onto the bearing,
 # so every part (boxes and wedge alike) squarely faces the incoming drone.
 _TOWER_QUAT = (
@@ -285,22 +311,40 @@ _TOWER_QUAT = (
   math.sin(0.5 * _APPROACH_YAW),
 )
 
-# Local frame: right triangle in x-z, extruded +-0.12 along y.
-# 0/1 = near-bottom edge, 2/3 = far-bottom edge, 4/5 = far-top edge.
-_WEDGE_VERTS = [
-  -_WEDGE_HALF_L, -_BOX_HALF[0], -_WEDGE_HALF_H,
-  -_WEDGE_HALF_L, +_BOX_HALF[0], -_WEDGE_HALF_H,
-  +_WEDGE_HALF_L, -_BOX_HALF[0], -_WEDGE_HALF_H,
-  +_WEDGE_HALF_L, +_BOX_HALF[0], -_WEDGE_HALF_H,
-  +_WEDGE_HALF_L, -_BOX_HALF[0], +_WEDGE_HALF_H,
-  +_WEDGE_HALF_L, +_BOX_HALF[0], +_WEDGE_HALF_H,
-]
+# Local frame: a plate whose top face carries the slope, with the low edge at
+# the body origin. Every tilt variant shares one body pose and differs only in
+# the mesh, which is what mjlab's per-world mesh variants require.
+#
+# The plate has a constant thickness so even a flat platform is a closed solid:
+# a zero-thickness sheet has coplanar vertices and MuJoCo refuses to build its
+# convex hull.
+_PLATFORM_THICKNESS = 0.02                           # m
+
+
+def _wedge_verts(tilt: float) -> list[float]:
+  rise = _platform_rise(tilt)
+  half_w = _BOX_HALF[0]
+  t = _PLATFORM_THICKNESS
+  l = _PLATFORM_L
+  return [
+    0.0, -half_w, 0.0,      # 0 low near bottom
+    0.0, +half_w, 0.0,      # 1 low far bottom
+    l, -half_w, 0.0,        # 2 high near bottom
+    l, +half_w, 0.0,        # 3 high far bottom
+    0.0, -half_w, t,        # 4 low near top
+    0.0, +half_w, t,        # 5 low far top
+    l, -half_w, t + 2.0 * rise,   # 6 high near top
+    l, +half_w, t + 2.0 * rise,   # 7 high far top
+  ]
+
+
 _WEDGE_FACES = [
-  0, 3, 2, 0, 1, 3,     # bottom
-  2, 5, 4, 2, 3, 5,     # upright far face
-  0, 5, 1, 0, 4, 5,     # sloped platform
-  0, 2, 4,              # end cap
-  1, 5, 3,              # end cap
+  0, 1, 2, 1, 3, 2,     # bottom
+  4, 6, 5, 5, 6, 7,     # sloped platform
+  0, 5, 1, 0, 4, 5,     # low edge
+  2, 3, 6, 3, 7, 6,     # high edge
+  0, 2, 4, 2, 6, 4,     # near side
+  1, 5, 3, 3, 5, 7,     # far side
 ]
 
 
@@ -321,20 +365,22 @@ _DRONE_GROUND_CONTACT_CFG = ContactSensorCfg(
   track_air_time=False,
 )
 
-# Drone <-> landing platform contact. Scoped to the wedge, so touching the
-# stack below does not count as a landing. `netforce` sums the whole contact
-# patch, so a resting drone reads ~its own weight whatever the attitude.
+# Drone <-> landing platform contact. Scoped to the wedge body, so touching the
+# stack below does not count as a landing. Matched by body rather than geom
+# because the per-world mesh variants rename the geom to a synthesized
+# "mjlab/pad/..." name. `netforce` sums the whole contact patch, so a resting
+# drone reads ~its own weight whatever the attitude.
 _DRONE_PLATFORM_CONTACT_CFG = ContactSensorCfg(
   name="drone_platform_contact",
   primary=ContactMatch(mode="geom", pattern="drone_geom", entity="drone"),
-  secondary=ContactMatch(mode="geom", pattern="top_geom", entity="tower_top"),
+  secondary=ContactMatch(mode="body", pattern="top", entity="tower_top"),
   fields=("found", "force", "normal", "tangent"),
   reduce="netforce",
   num_slots=1,
   track_air_time=False,
 )
 
-# Drone <-> tower boxes. The platform (`tower_top` / `top_geom`) is deliberately
+# Drone <-> tower boxes. The platform (`tower_top`'s `top` body) is deliberately
 # NOT included: it is the landing surface, so penalising it would teach the
 # drone not to touch down. The boxes are pure obstacles — a landing that needs
 # them was not a landing.
@@ -370,6 +416,7 @@ def _get_spec() -> mujoco.MjSpec:
 
 
 _DRONE_ARTICULATION = EntityArticulationInfoCfg(
+  # #remove? with ARX: nothing to actuate; the term writes the root state.
   actuators=(
     XmlActuatorCfg(
       target_names_expr=_SITE_NAMES,
@@ -412,20 +459,37 @@ def _box_spec_fn(center: tuple[float, float, float]):
   return build
 
 
-def _wedge_spec_fn():
-  """Spec for the tilted platform capping the tower.
+def _low_edge_pos() -> tuple[float, float, float]:
+  """World position of the platform's low edge, i.e. its body origin.
 
-  Body origin sits at the platform's midpoint, so the body pose *is* the
-  landing pose.
+  The wedge is pinned here (on the stack top, half a platform back from the
+  pad centre along the approach bearing) so every tilt variant can share the
+  same body pose and only swap its mesh.
+  """
+  half = 0.5 * _PLATFORM_L
+  return (
+    _PAD_XY[0] - half * math.cos(_APPROACH_YAW),
+    _PAD_XY[1] - half * math.sin(_APPROACH_YAW),
+    _STACK_TOP,
+  )
+
+
+def _wedge_spec_fn(tilt: float):
+  """Spec for a platform tilted by `tilt` radians.
+
+  Body origin sits at the low edge, so the mesh alone carries the tilt and
+  `VariantEntityCfg` can hand a different slope to every world.
   """
 
   def build() -> mujoco.MjSpec:
     spec = mujoco.MjSpec()
-    body = spec.worldbody.add_body(name="top", pos=_TARGET, quat=_TOWER_QUAT)
+    body = spec.worldbody.add_body(
+      name="top", pos=_low_edge_pos(), quat=_TOWER_QUAT
+    )
     body.add_freejoint(name="root")
     mesh = spec.add_mesh(
       name="wedge",
-      uservert=list(_WEDGE_VERTS),
+      uservert=_wedge_verts(tilt),
       userface=list(_WEDGE_FACES),
     )
     body.add_geom(
@@ -440,7 +504,52 @@ def _wedge_spec_fn():
   return build
 
 
-def _tower_entities() -> dict[str, EntityCfg]:
+# MuJoCo only builds a mesh's convex polytope when a *collision* geom uses it,
+# and a variant entity binds just one geom (the template) at compile time. The
+# other variants' meshes would then be collision-blind: the engine sees a mesh
+# with no hull, which shows up as a platform that sinks into the stack and
+# chatters. A hidden reference geom on a contact bit nothing else uses makes
+# the compiler do the work while still generating no contacts at runtime.
+_HULL_PROBE_CONTYPE = 2
+
+
+def _add_variant_hull_probes(spec: mujoco.MjSpec) -> None:
+  body = next(b for b in spec.bodies if b.name == "top")
+  used = {
+    geom.meshname
+    for geom in body.geoms
+    if geom.type == mujoco.mjtGeom.mjGEOM_MESH
+    and (int(geom.contype) or int(geom.conaffinity))
+  }
+  for mesh in spec.meshes:
+    if mesh.name in used:
+      continue
+    probe = body.add_geom()
+    probe.name = f"hull_probe_{mesh.name.replace('/', '_')}"
+    probe.type = mujoco.mjtGeom.mjGEOM_MESH
+    probe.meshname = mesh.name
+    probe.contype = _HULL_PROBE_CONTYPE
+    probe.conaffinity = 0
+    probe.density = 0.0
+    probe.rgba = (0.0, 0.0, 0.0, 0.0)
+
+
+class _PlatformEntity(Entity):
+  """Entity that compiles a collision hull for every platform variant."""
+
+  def _build_spec(self) -> None:
+    super()._build_spec()
+    _add_variant_hull_probes(self._spec)
+
+
+class _PlatformVariantCfg(VariantEntityCfg):
+  """`VariantEntityCfg` whose entity patches in the missing variant hulls."""
+
+  def build(self) -> Entity:
+    return _PlatformEntity(self)
+
+
+def _tower_entities(play: bool = False) -> dict[str, EntityCfg]:
   entities: dict[str, EntityCfg] = {}
   for i in range(_BOX_COUNT):
     center = (_TARGET[0], _TARGET[1], (i + 0.5) * 2.0 * _BOX_HALF[2])
@@ -448,9 +557,31 @@ def _tower_entities() -> dict[str, EntityCfg]:
       spec_fn=_box_spec_fn(center),
       init_state=EntityCfg.InitialStateCfg(pos=center, rot=_TOWER_QUAT),
     )
-  entities["tower_top"] = EntityCfg(
-    spec_fn=_wedge_spec_fn(),
-    init_state=EntityCfg.InitialStateCfg(pos=_TARGET, rot=_TOWER_QUAT),
+
+  # One mesh per tilt, spread evenly over the worlds.
+  variants = {
+    f"tilt_{degree:g}": _wedge_spec_fn(math.radians(degree))
+    for degree in _PLATFORM_TILT_DEG
+  }
+  if play:
+    if _PLAY_TILT_DEG not in _PLATFORM_TILT_DEG:
+      raise ValueError(
+        f"_PLAY_TILT_DEG = {_PLAY_TILT_DEG} is not in _PLATFORM_TILT_DEG "
+        f"{_PLATFORM_TILT_DEG}."
+      )
+    play_index = _PLATFORM_TILT_DEG.index(_PLAY_TILT_DEG)
+    assignment: dict[str, float] | Callable[[int], Sequence[int]] = (
+      lambda n: [play_index] * n
+    )
+  else:
+    assignment = {name: 1.0 for name in variants}
+
+  entities["tower_top"] = _PlatformVariantCfg(
+    variants=variants,
+    assignment=assignment,
+    init_state=EntityCfg.InitialStateCfg(
+      pos=_low_edge_pos(), rot=_TOWER_QUAT
+    ),
   )
   return entities
 
@@ -459,20 +590,56 @@ def _tower_entities() -> dict[str, EntityCfg]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _target_tensor(asset: Entity) -> torch.Tensor:
-  return torch.tensor(
-    _TARGET,
-    device=asset.data.root_link_pos_w.device,
-    dtype=asset.data.root_link_pos_w.dtype,
+def _pad_pose(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
+  """World pad centre and platform normal, one row per env.
+
+  Each world gets one tilt variant when the simulation is built (mjlab does
+  not resample mesh variants on reset), so this is computed once and cached.
+  The pad centre is the midpoint of the sloped face; `_PLATFORM_RISE` holds
+  the extra height each variant adds on top of the stack.
+  """
+  cached = getattr(env, "_pad_pose_cache", None)
+  if cached is not None:
+    return cached
+
+  assignment = env.sim.world_to_variant.get("tower_top")
+  if assignment is None:
+    idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+  else:
+    idx = assignment.to(device=env.device, dtype=torch.long)
+
+  dtype = torch.float32
+  rise = torch.tensor(_PLATFORM_RISE, device=env.device, dtype=dtype)[idx]
+  tilt = torch.tensor(_PLATFORM_TILTS, device=env.device, dtype=dtype)[idx]
+  sin_tilt, cos_tilt = torch.sin(tilt), torch.cos(tilt)
+
+  centre = torch.stack(
+    (
+      torch.full_like(rise, _PAD_XY[0]),
+      torch.full_like(rise, _PAD_XY[1]),
+      _STACK_TOP + _PLATFORM_THICKNESS + rise,
+    ),
+    dim=-1,
+  )
+  normal = torch.stack(
+    (
+      -sin_tilt * math.cos(_APPROACH_YAW),
+      -sin_tilt * math.sin(_APPROACH_YAW),
+      cos_tilt,
+    ),
+    dim=-1,
   )
 
+  env._pad_pose_cache = (centre, normal)
+  return centre, normal
 
-def _target_up_tensor(asset: Entity) -> torch.Tensor:
-  return torch.tensor(
-    _TARGET_UP,
-    device=asset.data.root_link_pos_w.device,
-    dtype=asset.data.root_link_pos_w.dtype,
-  )
+
+def _target_tensor(env: ManagerBasedRlEnv) -> torch.Tensor:
+  return _pad_pose(env)[0]
+
+
+def _target_up_tensor(env: ManagerBasedRlEnv) -> torch.Tensor:
+  return _pad_pose(env)[1]
 
 
 def _tilt_error(
@@ -497,7 +664,7 @@ def _tilt_error(
     ),
     dim=-1,
   )
-  cos = torch.clamp((up * _target_up_tensor(asset)).sum(dim=-1), -1.0, 1.0)
+  cos = torch.clamp((up * _target_up_tensor(env)).sum(dim=-1), -1.0, 1.0)
   return torch.acos(cos)
 
 
@@ -528,6 +695,8 @@ def _log_half_width(pct: float) -> float:
   return 0.5 * math.log1p(pct)
 
 
+# #remove? with ARX: the whole motor chain (delay, gain, lag, site forces,
+# rotor drag) is replaced by one filter that prescribes the rate.
 @dataclass(kw_only=True)
 class DrThrustActionCfg(SiteEffortActionCfg):
   """Site effort control with per-env thrust gain, motor lag and delay.
@@ -781,7 +950,7 @@ def drone_rel_pos(
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   return torch.clamp(
-    asset.data.root_link_pos_w - _target_tensor(asset), -5.0, 5.0
+    asset.data.root_link_pos_w - _target_tensor(env), -5.0, 5.0
   )
 
 
@@ -810,7 +979,7 @@ def target_up_body(
   Lets the policy see which way it has to tilt to reach the target attitude.
   """
   asset: Entity = env.scene[asset_cfg.name]
-  n = _target_up_tensor(asset).unsqueeze(0).expand(env.num_envs, -1)
+  n = _target_up_tensor(env)
   return quat_apply_inverse(asset.data.root_link_quat_w, n)
 
 
@@ -830,7 +999,7 @@ def distance_penalty(
   """
   asset: Entity = env.scene[asset_cfg.name]
   dist = torch.norm(
-    asset.data.root_link_pos_w - _target_tensor(asset), dim=-1
+    asset.data.root_link_pos_w - _target_tensor(env), dim=-1
   )
   return -torch.clamp(dist, max=_REWARD_ALIVE)
 
@@ -854,7 +1023,7 @@ def closing_speed(
   than merely being close to it.
   """
   asset: Entity = env.scene[asset_cfg.name]
-  to_goal = _target_tensor(asset) - asset.data.root_link_pos_w
+  to_goal = _target_tensor(env) - asset.data.root_link_pos_w
   direction = to_goal / torch.norm(to_goal, dim=-1, keepdim=True).clamp_min(1e-6)
   closing = (asset.data.root_link_lin_vel_w * direction).sum(dim=-1)
   return torch.clamp(closing, -10.0, 10.0)
@@ -927,7 +1096,7 @@ def attitude_penalty(
   asset: Entity = env.scene[asset_cfg.name]
   err = _tilt_error(env, asset_cfg)
   dist = torch.norm(
-    asset.data.root_link_pos_w - _target_tensor(asset), dim=-1
+    asset.data.root_link_pos_w - _target_tensor(env), dim=-1
   )
   gate = torch.clamp((gate_radius - dist) / gate_radius, 0.0, 1.0)
   return -err * gate
@@ -982,7 +1151,7 @@ def _at_goal(
   step."""
   asset: Entity = env.scene[asset_cfg.name]
   pos_err = torch.norm(
-    asset.data.root_link_pos_w - _target_tensor(asset), dim=-1
+    asset.data.root_link_pos_w - _target_tensor(env), dim=-1
   )
   speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
   ok = (
@@ -1104,7 +1273,7 @@ def success(
 # Env config
 # ---------------------------------------------------------------------------
 
-def _make_env_cfg() -> ManagerBasedRlEnvCfg:
+def _make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   actor_terms = {
     "rel_pos": ObservationTermCfg(func=drone_rel_pos),
     "lin_vel": ObservationTermCfg(
@@ -1131,6 +1300,7 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
   }
 
   actions: dict[str, ActionTermCfg] = {
+    # #remove? with ARX: replaced by one term that outputs thrust + 3 rates.
     "rotor_thrusts": DrThrustActionCfg(
       entity_name="drone",
       actuator_names=_SITE_NAMES,
@@ -1169,7 +1339,7 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
   return ManagerBasedRlEnvCfg(
     scene=SceneCfg(
       terrain=TerrainEntityCfg(terrain_type="plane"),
-      entities={"drone": _get_drone_cfg(), **_tower_entities()},
+      entities={"drone": _get_drone_cfg(), **_tower_entities(play=play)},
       sensors=(
         _DRONE_GROUND_CONTACT_CFG,
         _DRONE_PLATFORM_CONTACT_CFG,
@@ -1204,7 +1374,7 @@ def _make_env_cfg() -> ManagerBasedRlEnvCfg:
 
 
 def drone_tilted_landing_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  cfg = _make_env_cfg()
+  cfg = _make_env_cfg(play=play)
   if play:
     cfg.observations["actor"].enable_corruption = False
     # Domain randomization must never leak into an evaluation: no randomized
