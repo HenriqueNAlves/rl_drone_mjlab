@@ -1,0 +1,135 @@
+<mujoco model="drone">
+  <compiler angle="radian" autolimits="true"/>
+
+  <option timestep="0.002" integrator="implicitfast"/>
+
+  <worldbody>
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+
+    <!-- Inertia: identified from the flight log as I = tau_max / alpha_max,
+         with tau_max = 2 * 0.065 m * 1.04 N = 0.135 N*m and alpha_max =
+         253 rad/s^2 (roll), 90 rad/s^2 (yaw). The previous values
+         (0.005 / 0.01) implied a 0.18 m effective radius, i.e. a 500 g-class
+         quad, and made the simulated drone ~9x too sluggish.
+
+         The explicit <inertial> is what the plant uses: the visual geoms below
+         are `density="0"` and `contype="0" conaffinity="0"`, so they add no
+         mass, no inertia and no contacts. Only `drone_geom` collides, and it
+         is unchanged -- the look of the aircraft is decoupled from its
+         dynamics on purpose, so a change here can never invalidate a policy.
+
+         Frame is FLU: +x forward, +y left, +z up. Front props are blue so the
+         heading is readable in the viewer. -->
+    <body name="drone" pos="0 0 1.0">
+      <freejoint name="root"/>
+      <inertial pos="0 0 0" mass="0.16" diaginertia="0.00053 0.00053 0.0009"/>
+
+      <!-- Collision shape. Must stay as the only contact geom: the touch-down
+           height, the tilt-on-edge behaviour and every trained contact reward
+           depend on this 13 x 13 x 8 cm box. Invisible. -->
+      <geom name="drone_geom" type="box" size="0.065 0.065 0.04"
+            rgba="0 0 0 0" density="0"/>
+
+      <!-- Airframe: bottom plate, stack, and four arms out to the rotors. -->
+      <geom name="frame_plate" type="box" size="0.040 0.030 0.004"
+            pos="0 0 0.002" rgba="0.12 0.12 0.14 1"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="stack" type="box" size="0.026 0.022 0.010"
+            pos="0 0 0.016" rgba="0.15 0.35 0.75 1"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="battery" type="box" size="0.030 0.020 0.006"
+            pos="-0.008 0 0.030" rgba="0.08 0.08 0.09 1"
+            contype="0" conaffinity="0" density="0"/>
+
+      <geom name="arm_fl" type="box" size="0.046 0.0035 0.002"
+            pos="0.0325 0.0325 0.002" quat="0.92388 0 0 0.38268"
+            rgba="0.15 0.15 0.17 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="arm_fr" type="box" size="0.046 0.0035 0.002"
+            pos="0.0325 -0.0325 0.002" quat="0.92388 0 0 -0.38268"
+            rgba="0.15 0.15 0.17 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="arm_rl" type="box" size="0.046 0.0035 0.002"
+            pos="-0.0325 0.0325 0.002" quat="0.38268 0 0 0.92388"
+            rgba="0.15 0.15 0.17 1" contype="0" conaffinity="0" density="0"/>
+      <geom name="arm_rr" type="box" size="0.046 0.0035 0.002"
+            pos="-0.0325 -0.0325 0.002" quat="0.38268 0 0 -0.92388"
+            rgba="0.15 0.15 0.17 1" contype="0" conaffinity="0" density="0"/>
+
+      <!-- Motor bells and props, on the four rotor sites. -->
+      <geom name="motor_fl" type="cylinder" size="0.011 0.007"
+            pos="0.065 0.065 0.009" rgba="0.25 0.25 0.28 1"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="motor_fr" type="cylinder" size="0.011 0.007"
+            pos="0.065 -0.065 0.009" rgba="0.25 0.25 0.28 1"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="motor_rl" type="cylinder" size="0.011 0.007"
+            pos="-0.065 0.065 0.009" rgba="0.25 0.25 0.28 1"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="motor_rr" type="cylinder" size="0.011 0.007"
+            pos="-0.065 -0.065 0.009" rgba="0.25 0.25 0.28 1"
+            contype="0" conaffinity="0" density="0"/>
+
+      <geom name="blade_fl_a" type="box" size="0.033 0.0034 0.0006"
+            pos="0.065 0.065 0.017" quat="1 0 0 0" rgba="0.05 0.10 0.55 0.95"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="blade_fl_b" type="box" size="0.033 0.0034 0.0006"
+            pos="0.065 0.065 0.017" quat="0.70711 0 0 0.70711" rgba="0.05 0.10 0.55 0.95"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="hub_fl" type="cylinder" size="0.005 0.0022"
+            pos="0.065 0.065 0.017" rgba="0.18 0.18 0.20 1"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="blade_fr_a" type="box" size="0.033 0.0034 0.0006"
+            pos="0.065 -0.065 0.017" quat="1 0 0 0" rgba="0.05 0.10 0.55 0.95"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="blade_fr_b" type="box" size="0.033 0.0034 0.0006"
+            pos="0.065 -0.065 0.017" quat="0.70711 0 0 0.70711" rgba="0.05 0.10 0.55 0.95"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="hub_fr" type="cylinder" size="0.005 0.0022"
+            pos="0.065 -0.065 0.017" rgba="0.18 0.18 0.20 1"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="blade_rl_a" type="box" size="0.033 0.0034 0.0006"
+            pos="-0.065 0.065 0.017" quat="1 0 0 0" rgba="0.85 0.86 0.88 0.95"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="blade_rl_b" type="box" size="0.033 0.0034 0.0006"
+            pos="-0.065 0.065 0.017" quat="0.70711 0 0 0.70711" rgba="0.85 0.86 0.88 0.95"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="hub_rl" type="cylinder" size="0.005 0.0022"
+            pos="-0.065 0.065 0.017" rgba="0.18 0.18 0.20 1"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="blade_rr_a" type="box" size="0.033 0.0034 0.0006"
+            pos="-0.065 -0.065 0.017" quat="1 0 0 0" rgba="0.85 0.86 0.88 0.95"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="blade_rr_b" type="box" size="0.033 0.0034 0.0006"
+            pos="-0.065 -0.065 0.017" quat="0.70711 0 0 0.70711" rgba="0.85 0.86 0.88 0.95"
+            contype="0" conaffinity="0" density="0"/>
+      <geom name="hub_rr" type="cylinder" size="0.005 0.0022"
+            pos="-0.065 -0.065 0.017" rgba="0.18 0.18 0.20 1"
+            contype="0" conaffinity="0" density="0"/>
+
+      <site name="rotor_fl" pos="0.065 0.065 0"/>
+      <site name="rotor_fr" pos="0.065 -0.065 0"/>
+      <site name="rotor_rl" pos="-0.065 0.065 0"/>
+      <site name="rotor_rr" pos="-0.065 -0.065 0"/>
+    </body>
+
+    <body name="target_marker" pos="0 0 1.0">
+      <geom type="sphere" size="0.15"
+            rgba="0.1 0.9 0.2 0.5"
+            contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <!-- Rotors. `ctrlrange` is the measured 1.04 N per motor, not 0.88.
+       The gear's rotational part is the reaction torque: 0.017 N*m per N of
+       thrust, with opposite signs on the diagonal pairs (fl/rr vs fr/rl) so
+       that differential thrust produces a net yaw torque instead of a
+       thrust-proportional one. Without this the model has no yaw authority
+       at all, while the real quad reaches 8.8 rad/s. -->
+  <!-- #remove? with ARX: nothing for a motor to drive; the term writes the
+       rate onto the root and applies thrust as one wrench at the COM. -->
+  <actuator>
+    <motor name="thrust_fl" site="rotor_fl" gear="0 0 1 0 0 0.017" ctrlrange="0 1.04"/>
+    <motor name="thrust_fr" site="rotor_fr" gear="0 0 1 0 0 -0.017" ctrlrange="0 1.04"/>
+    <motor name="thrust_rl" site="rotor_rl" gear="0 0 1 0 0 -0.017" ctrlrange="0 1.04"/>
+    <motor name="thrust_rr" site="rotor_rr" gear="0 0 1 0 0 0.017" ctrlrange="0 1.04"/>
+  </actuator>
+</mujoco>
