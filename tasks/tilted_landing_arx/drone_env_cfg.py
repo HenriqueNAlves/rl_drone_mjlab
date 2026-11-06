@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import math
 
@@ -18,7 +17,6 @@ from mjlab.entity import (
   Entity,
   EntityArticulationInfoCfg,
   EntityCfg,
-  VariantEntityCfg,
 )
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import (
@@ -30,6 +28,7 @@ from mjlab.envs.mdp import (
 from mjlab.envs.mdp.actions import SiteEffortAction, SiteEffortActionCfg
 from mjlab.managers.action_manager import ActionTerm, ActionTermCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import (
   ObservationGroupCfg,
   ObservationTermCfg,
@@ -68,6 +67,7 @@ if TYPE_CHECKING:
 
 _DRONE_XML: Path = Path(__file__).parent / "drone.xml"
 _DRONE_CFG = SceneEntityCfg("drone")
+_TOWER_TOP_CFG = SceneEntityCfg("tower_top")
 
 # Nominal spawn point: above the tower top so the drone approaches from above
 # and descends onto it instead of flying into the stack's side. Its height is
@@ -77,43 +77,32 @@ _SPAWN_HEIGHT = 0.5                                 # m, mean spawn altitude
 _SPAWN = (0.0, 0.0, _SPAWN_HEIGHT)
 
 # --- Tower geometry -------------------------------------------------------
-# Three loose boxes stacked under the tilted platform. Declared up here because
-# the platform height (and therefore the target) is derived from the stack.
+# Three loose boxes stacked under the landing platform. Declared up here
+# because the platform height (and therefore the target) is derived from the
+# stack.
 _BOX_HALF = (0.12, 0.12, 0.07)                       # 0.24 x 0.24 footprint
 _BOX_COUNT = 3
 _TOWER_MASS = 0.5                                    # kg, per loose piece
 _STACK_TOP = _BOX_COUNT * 2.0 * _BOX_HALF[2]         # 0.42 m
 
-# Half-length of the platform along the slope. Identical for every tilt, so
-# the pad footprint never changes with the angle. (Pinning the height instead
-# would stretch a shallow ramp into a 0.9 m seesaw balanced on a 0.24 m box.)
-_WEDGE_HALF_L = 0.138564                             # m
-_PLATFORM_L = 2.0 * _WEDGE_HALF_L                    # m
+# The landing platform is a flat plate. Its tilt is the body's pitch, so the
+# angle can be any value the reset event draws; a mesh with the slope baked in
+# could not be re-angled without rebuilding the model.
+_PLATFORM_HALF_L = 0.138564                          # m
+_PLATFORM_L = 2.0 * _PLATFORM_HALF_L                 # m
+_PLATFORM_THICKNESS = 0.02                           # m
 
-# Platform tilts a mesh exists for. mjlab can give different worlds different
-# *mesh* variants of the same entity; we deliberately do not use that spread.
-# The real tower is one object with one slope, so training across all four
-# spends three quarters of the experience on worlds that do not exist and
-# makes the policy hedge against a tilt it will never meet.
-#
-# 45 deg is deliberately absent: friction is MuJoCo's default mu = 1.0 and
-# tan(45 deg) = 1.0, so at 45 deg the drone is exactly at the sliding
-# threshold and the outcome is luck, not skill.
-_PLATFORM_TILT_DEG = (0.0, 10.0, 20.0, 30.0)
-_PLATFORM_TILTS = tuple(math.radians(d) for d in _PLATFORM_TILT_DEG)
+# The platform is a kinematic fixture, held at the sampled pose. It must not
+# push the loose stack below it, so its low edge sits this far above the stack
+# top. 2 mm is invisible and keeps the platform out of contact with the boxes.
+_PLATFORM_GAP = 0.002                                # m
 
-# The one slope every world gets, training and play alike. Set this to the
-# measured tilt of the real pad; a different angle is a different run (and a
-# different checkpoint), not a bigger batch.
-_TILT_DEG = 10.0
-
-
-def _platform_rise(tilt: float) -> float:
-  """How far the platform's high edge rises above its low edge."""
-  return _WEDGE_HALF_L * math.tan(tilt)
-
-
-_PLATFORM_RISE = tuple(_platform_rise(t) for t in _PLATFORM_TILTS)
+# Per-episode tilt range, sampled uniformly. The real pad is 10 deg; training
+# across 0-30 deg teaches a policy that does not assume one slope. Set both
+# ends to the same value for a single-angle run. 45 deg is excluded: with
+# MuJoCo's default mu = 1.0, tan(45 deg) = 1.0 puts the drone exactly at the
+# sliding threshold, where the outcome is luck rather than skill.
+_TILT_RANGE_DEG = (0.0, 30.0)
 
 # Pad centre in the horizontal plane. The height depends on the variant: the
 # wedge's low edge is pinned to the stack top, so the pad centre (the midpoint
@@ -169,6 +158,62 @@ _PENALTY_TIMEOUT = 60.0
 # One-shot value = weight * dt, so keep the weight above ~2200.
 _REWARD_SUCCESS = 5000.0
 
+# Touchdown quality. The success test only asks for < 0.15 m/s *at some step*
+# while touching the pad, and the contact impulse arrests a 1 m/s descent
+# inside one 20 ms control step -- so a hard landing still scores success and
+# no term ever sees the impact itself.
+#
+# Penalising speed after contact was tried at several weights and does not
+# work. The contact sample is already post-impulse, so the bill is mostly the
+# skid down the 10 deg ramp (contact lasts ~19 steps and the speed *rises*
+# during it), and any weight big enough to bite makes hovering the better
+# trade. A penalty for arriving can always be avoided by not arriving.
+#
+# So the signal is positive and paid once, with the success step, scaled by how
+# slow the approach was. Measured at the last sample before contact (see
+# `_ImpactLatch`):
+#
+#   q = clamp((FAST - v) / (FAST - SLOW), 0, 1)
+#
+# One-shot value is ``weight * dt``, so 5000 pays up to 100. A soft landing is
+# then worth ~200, a fast one 100, and hovering still nothing at all.
+_SOFT_IMPACT_SLOW = 0.25    # m/s, full bonus at or below
+_SOFT_IMPACT_FAST = 0.90    # m/s, no bonus at or above
+_REWARD_SOFT_IMPACT = 5000.0
+#
+# The old per-step form is kept as an ablation and disabled. Set it to ~500 and
+# `_REWARD_SOFT_IMPACT` to 0 to recover that run.
+_LANDING_SPEED_TOL = 0.5    # m/s
+_PENALTY_LANDING_SPEED = 0.0
+
+# Route efficiency. No per-step term measures the path flown: the distance term
+# is "how close am I *now*" (a loop that stays near the pad scores well), and
+# `closing_speed` refunds the return leg. So a detour is nearly free -- measured
+# at the 1000-iteration run, the whole route was worth ~2 points out of ~197.
+#
+# This pays once, at success, for how close the flown arc length was to the
+# straight line from the spawn (see `_PathTracker`):
+#
+#   eff = spawn_distance / path_flown
+#   q   = clamp((eff - LOW) / (HIGH - LOW), 0, 1)
+#
+# One-shot value is ``weight * dt``: 3000 pays up to 60, two thirds of a perfect
+# touchdown. Zero sits at 0.70 so a wandering episode earns nothing; full credit
+# at 0.90. A signed version that also charged bad routes was tried on Nov 6 and
+# made the 2000-iteration run worse (§I.46); the route now gates the soft bonus
+# instead (see `_SOFT_ROUTE_LOW`).
+_PATH_EFF_LOW = 0.70     # at or below: no bonus
+_PATH_EFF_HIGH = 0.90    # at or above: full bonus
+_REWARD_PATH = 3000.0
+
+# Route gate on the soft bonus. A soft touchdown only counts if the drone flew
+# there reasonably directly: below LOW it earns nothing, at HIGH and above it
+# is unchanged. This is the targeted version of the failed signed path term
+# (§I.46): it removes the "soft but sloppy" payoff without charging every
+# imperfect approach.
+_SOFT_ROUTE_LOW = 0.60
+_SOFT_ROUTE_HIGH = 0.75
+
 # Target-attitude shaping: -tilt_error (rad), ramped in over the last
 # `_TILT_GATE_RADIUS` metres. Applied everywhere it would fight the tilt the
 # drone needs in order to fly and brake, so it is gated to the landing.
@@ -181,7 +226,7 @@ _SUCCESS_VEL_TOL = 0.15     # m/s
 # Curriculum: 12 deg on the 10 deg ramp, then 10 deg on the 20 deg ramp,
 # then 5 deg on the final 30 deg ramp. Keep it a bit looser than the ramp
 # while the policy is still learning to arrive tilted at all.
-_SUCCESS_TILT_TOL = math.radians(12.0)
+_SUCCESS_TILT_TOL = math.radians(20.0)
 # Require the drone to actually touch the platform, not just fly through the
 # landing pose. Set False to let "at the pose, slow, tilted" count on its own.
 _SUCCESS_REQUIRE_CONTACT = True
@@ -377,68 +422,27 @@ _ARX_GRAVITY = 9.81                    # m/s^2, thrust = c * m * g
 # ---------------------------------------------------------------------------
 # Tower
 # ---------------------------------------------------------------------------
-# Four loose bodies: three stacked boxes plus a wedge on top. Nothing is
-# welded, so the drone can tumble the stack. mjlab allows at most one freejoint
-# per Entity, so each loose body is its own Entity; with no reset event they
-# reset to their stacked poses from the model default every episode.
+# Three loose boxes plus a platform on top. The boxes are separate free bodies,
+# so a collision can tumble them; mjlab allows at most one freejoint per Entity,
+# so each is its own Entity.
 #
-# The wedge's sloped face is the landing platform. Its profile is a prism whose
-# hypotenuse is the platform: it runs from the stack top up to the platform's
-# high edge, with its normal leaning back toward the spawn (the same attitude
-# the drone has to hold to land on it).
-# Every world gets the same tilt, `_TILT_DEG`, as a mesh variant: one run is
-# one slope, deliberately, because the real tower has one.
+# The platform is a fixed-base mocap entity: it is kinematic, and its pose is
+# written by `_reset_tower_tilt` at every episode reset. That is what makes a
+# per-episode tilt possible without rebuilding the model. The loose boxes below
+# are unaffected.
 
 # Box colours.
 _BOX_RGBA = (0.72, 0.52, 0.28, 1.0)
 _TOP_RGBA = (0.86, 0.70, 0.34, 1.0)
 
-# `_WEDGE_HALF_L` / `_PLATFORM_TILT_DEG` / `_STACK_TOP` live at the top of the
-# file, so changing the slope range is one tuple.
 # The whole tower is built in a flat local frame and yawed onto the bearing,
-# so every part (boxes and wedge alike) squarely faces the incoming drone.
+# so every part (boxes and plate alike) squarely faces the incoming drone.
 _TOWER_QUAT = (
   math.cos(0.5 * _APPROACH_YAW),
   0.0,
   0.0,
   math.sin(0.5 * _APPROACH_YAW),
 )
-
-# Local frame: a plate whose top face carries the slope, with the low edge at
-# the body origin. Every tilt variant shares one body pose and differs only in
-# the mesh, which is what mjlab's per-world mesh variants require.
-#
-# The plate has a constant thickness so even a flat platform is a closed solid:
-# a zero-thickness sheet has coplanar vertices and MuJoCo refuses to build its
-# convex hull.
-_PLATFORM_THICKNESS = 0.02                           # m
-
-
-def _wedge_verts(tilt: float) -> list[float]:
-  rise = _platform_rise(tilt)
-  half_w = _BOX_HALF[0]
-  t = _PLATFORM_THICKNESS
-  l = _PLATFORM_L
-  return [
-    0.0, -half_w, 0.0,      # 0 low near bottom
-    0.0, +half_w, 0.0,      # 1 low far bottom
-    l, -half_w, 0.0,        # 2 high near bottom
-    l, +half_w, 0.0,        # 3 high far bottom
-    0.0, -half_w, t,        # 4 low near top
-    0.0, +half_w, t,        # 5 low far top
-    l, -half_w, t + 2.0 * rise,   # 6 high near top
-    l, +half_w, t + 2.0 * rise,   # 7 high far top
-  ]
-
-
-_WEDGE_FACES = [
-  0, 1, 2, 1, 3, 2,     # bottom
-  4, 6, 5, 5, 6, 7,     # sloped platform
-  0, 5, 1, 0, 4, 5,     # low edge
-  2, 3, 6, 3, 7, 6,     # high edge
-  0, 2, 4, 2, 6, 4,     # near side
-  1, 5, 3, 3, 5, 7,     # far side
-]
 
 
 # ---------------------------------------------------------------------------
@@ -458,11 +462,11 @@ _DRONE_GROUND_CONTACT_CFG = ContactSensorCfg(
   track_air_time=False,
 )
 
-# Drone <-> landing platform contact. Scoped to the wedge body, so touching the
-# stack below does not count as a landing. Matched by body rather than geom
-# because the per-world mesh variants rename the geom to a synthesized
-# "mjlab/pad/..." name. `netforce` sums the whole contact patch, so a resting
-# drone reads ~its own weight whatever the attitude.
+# Drone <-> landing platform contact. Scoped to the platform body, so touching
+# the stack below does not count as a landing. Matched by body rather than geom
+# so the platform's box geom can be renamed without touching this. `netforce`
+# sums the whole contact patch, so a resting drone reads ~its own weight
+# whatever the attitude.
 _DRONE_PLATFORM_CONTACT_CFG = ContactSensorCfg(
   name="drone_platform_contact",
   primary=ContactMatch(mode="geom", pattern="drone_geom", entity="drone"),
@@ -553,94 +557,22 @@ def _box_spec_fn(center: tuple[float, float, float]):
   return build
 
 
-def _low_edge_pos() -> tuple[float, float, float]:
-  """World position of the platform's low edge, i.e. its body origin.
+def _platform_spec_fn() -> mujoco.MjSpec:
+  """Spec for the flat landing plate.
 
-  The wedge is pinned here (on the stack top, half a platform back from the
-  pad centre along the approach bearing) so every tilt variant can share the
-  same body pose and only swap its mesh.
+  No freejoint: `auto_wrap_fixed_base_mocap` wraps the body in a mocap base,
+  so the reset event can write a new pose every episode.
   """
-  half = 0.5 * _PLATFORM_L
-  return (
-    _PAD_XY[0] - half * math.cos(_APPROACH_YAW),
-    _PAD_XY[1] - half * math.sin(_APPROACH_YAW),
-    _STACK_TOP,
+  spec = mujoco.MjSpec()
+  body = spec.worldbody.add_body(name="top")
+  body.add_geom(
+    name="top_geom",
+    type=mujoco.mjtGeom.mjGEOM_BOX,
+    size=(0.5 * _PLATFORM_L, _BOX_HALF[0], 0.5 * _PLATFORM_THICKNESS),
+    mass=_TOWER_MASS,
+    rgba=_TOP_RGBA,
   )
-
-
-def _wedge_spec_fn(tilt: float):
-  """Spec for a platform tilted by `tilt` radians.
-
-  Body origin sits at the low edge, so the mesh alone carries the tilt and
-  `VariantEntityCfg` can hand a different slope to every world.
-  """
-
-  def build() -> mujoco.MjSpec:
-    spec = mujoco.MjSpec()
-    body = spec.worldbody.add_body(
-      name="top", pos=_low_edge_pos(), quat=_TOWER_QUAT
-    )
-    body.add_freejoint(name="root")
-    mesh = spec.add_mesh(
-      name="wedge",
-      uservert=_wedge_verts(tilt),
-      userface=list(_WEDGE_FACES),
-    )
-    body.add_geom(
-      name="top_geom",
-      type=mujoco.mjtGeom.mjGEOM_MESH,
-      meshname=mesh.name,
-      mass=_TOWER_MASS,
-      rgba=_TOP_RGBA,
-    )
-    return spec
-
-  return build
-
-
-# MuJoCo only builds a mesh's convex polytope when a *collision* geom uses it,
-# and a variant entity binds just one geom (the template) at compile time. The
-# other variants' meshes would then be collision-blind: the engine sees a mesh
-# with no hull, which shows up as a platform that sinks into the stack and
-# chatters. A hidden reference geom on a contact bit nothing else uses makes
-# the compiler do the work while still generating no contacts at runtime.
-_HULL_PROBE_CONTYPE = 2
-
-
-def _add_variant_hull_probes(spec: mujoco.MjSpec) -> None:
-  body = next(b for b in spec.bodies if b.name == "top")
-  used = {
-    geom.meshname
-    for geom in body.geoms
-    if geom.type == mujoco.mjtGeom.mjGEOM_MESH
-    and (int(geom.contype) or int(geom.conaffinity))
-  }
-  for mesh in spec.meshes:
-    if mesh.name in used:
-      continue
-    probe = body.add_geom()
-    probe.name = f"hull_probe_{mesh.name.replace('/', '_')}"
-    probe.type = mujoco.mjtGeom.mjGEOM_MESH
-    probe.meshname = mesh.name
-    probe.contype = _HULL_PROBE_CONTYPE
-    probe.conaffinity = 0
-    probe.density = 0.0
-    probe.rgba = (0.0, 0.0, 0.0, 0.0)
-
-
-class _PlatformEntity(Entity):
-  """Entity that compiles a collision hull for every platform variant."""
-
-  def _build_spec(self) -> None:
-    super()._build_spec()
-    _add_variant_hull_probes(self._spec)
-
-
-class _PlatformVariantCfg(VariantEntityCfg):
-  """`VariantEntityCfg` whose entity patches in the missing variant hulls."""
-
-  def build(self) -> Entity:
-    return _PlatformEntity(self)
+  return spec
 
 
 def _tower_entities() -> dict[str, EntityCfg]:
@@ -652,27 +584,15 @@ def _tower_entities() -> dict[str, EntityCfg]:
       init_state=EntityCfg.InitialStateCfg(pos=center, rot=_TOWER_QUAT),
     )
 
-  # One mesh per tilt exists, but every world is assigned the same one: the
-  # tower is a single physical object with a single slope.
-  variants = {
-    f"tilt_{degree:g}": _wedge_spec_fn(math.radians(degree))
-    for degree in _PLATFORM_TILT_DEG
-  }
-  if _TILT_DEG not in _PLATFORM_TILT_DEG:
-    raise ValueError(
-      f"_TILT_DEG = {_TILT_DEG} is not in _PLATFORM_TILT_DEG "
-      f"{_PLATFORM_TILT_DEG}."
-    )
-  tilt_index = _PLATFORM_TILT_DEG.index(_TILT_DEG)
-  assignment: dict[str, float] | Callable[[int], Sequence[int]] = (
-    lambda n: [tilt_index] * n
-  )
-
-  entities["tower_top"] = _PlatformVariantCfg(
-    variants=variants,
-    assignment=assignment,
+  entities["tower_top"] = EntityCfg(
+    spec_fn=_platform_spec_fn,
     init_state=EntityCfg.InitialStateCfg(
-      pos=_low_edge_pos(), rot=_TOWER_QUAT
+      pos=(
+        _PAD_XY[0],
+        _PAD_XY[1],
+        _STACK_TOP + _PLATFORM_GAP + 0.5 * _PLATFORM_THICKNESS,
+      ),
+      rot=_TOWER_QUAT,
     ),
   )
   return entities
@@ -682,48 +602,60 @@ def _tower_entities() -> dict[str, EntityCfg]:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _platform_pose(
+  tilt: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  """World pose of the platform body and its top-face centre and normal.
+
+  ``tilt`` is an ``(N,)`` tensor in radians. The body's local +x runs up the
+  slope and local +z is the platform normal, so the same rotation that places
+  the mesh also defines the pad normal used by the reward and observations.
+  The low edge of the plate's bottom face sits ``_PLATFORM_GAP`` above the
+  stack top: the platform is kinematic, and this keeps it clear of the loose
+  boxes underneath.
+  """
+  ct, st = torch.cos(tilt), torch.sin(tilt)
+  ux, uy = math.cos(_APPROACH_YAW), math.sin(_APPROACH_YAW)
+  half_l = 0.5 * _PLATFORM_L
+  half_t = 0.5 * _PLATFORM_THICKNESS
+
+  low = torch.stack(
+    (
+      torch.full_like(tilt, _PAD_XY[0] - half_l * ux),
+      torch.full_like(tilt, _PAD_XY[1] - half_l * uy),
+      torch.full_like(tilt, _STACK_TOP + _PLATFORM_GAP),
+    ),
+    dim=-1,
+  )
+  tangent = torch.stack((ct * ux, ct * uy, st), dim=-1)
+  normal = torch.stack((-st * ux, -st * uy, ct), dim=-1)
+
+  body = low + half_l * tangent + half_t * normal
+  pad = low + half_l * tangent + _PLATFORM_THICKNESS * normal
+  quat = quat_from_euler_xyz(
+    torch.zeros_like(tilt), -tilt, torch.full_like(tilt, _APPROACH_YAW)
+  )
+  return body, quat, pad, normal
+
+
 def _pad_pose(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, torch.Tensor]:
   """World pad centre and platform normal, one row per env.
 
-  Every world shares the single tilt variant `_TILT_DEG` (mjlab assigns mesh
-  variants when the simulation is built and never resamples them), so all rows
-  are identical; the per-env shape is kept because every reward, observation
-  and termination term indexes it per env.
-  The pad centre is the midpoint of the sloped face; `_PLATFORM_RISE` holds
-  the extra height each variant adds on top of the stack.
+  The tilt is sampled per episode by `_reset_tower_tilt` and kept on
+  ``env._platform_tilt``. This derives the geometry from that value and caches
+  it until the next reset, so every reward, observation and termination term
+  sees the same pad.
   """
   cached = getattr(env, "_pad_pose_cache", None)
   if cached is not None:
     return cached
 
-  assignment = env.sim.world_to_variant.get("tower_top")
-  if assignment is None:
-    idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-  else:
-    idx = assignment.to(device=env.device, dtype=torch.long)
+  tilt = getattr(env, "_platform_tilt", None)
+  if tilt is None:
+    tilt = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    env._platform_tilt = tilt
 
-  dtype = torch.float32
-  rise = torch.tensor(_PLATFORM_RISE, device=env.device, dtype=dtype)[idx]
-  tilt = torch.tensor(_PLATFORM_TILTS, device=env.device, dtype=dtype)[idx]
-  sin_tilt, cos_tilt = torch.sin(tilt), torch.cos(tilt)
-
-  centre = torch.stack(
-    (
-      torch.full_like(rise, _PAD_XY[0]),
-      torch.full_like(rise, _PAD_XY[1]),
-      _STACK_TOP + _PLATFORM_THICKNESS + rise,
-    ),
-    dim=-1,
-  )
-  normal = torch.stack(
-    (
-      -sin_tilt * math.cos(_APPROACH_YAW),
-      -sin_tilt * math.sin(_APPROACH_YAW),
-      cos_tilt,
-    ),
-    dim=-1,
-  )
-
+  _, _, centre, normal = _platform_pose(tilt)
   env._pad_pose_cache = (centre, normal)
   return centre, normal
 
@@ -1181,12 +1113,43 @@ def _reset_drone_around_platform(
   )
 
 
+def _reset_tower_tilt(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  tilt_range_deg: tuple[float, float] = _TILT_RANGE_DEG,
+  asset_cfg: SceneEntityCfg = _TOWER_TOP_CFG,
+) -> None:
+  """Draw this episode's platform tilt and write the platform pose.
+
+  The platform is a fixed-base mocap entity, so the whole pose is one write;
+  there is no mesh swap and no model rebuild. The sampled angle is kept on the
+  env because every reward, observation and termination term derives the pad
+  centre and normal from it.
+  """
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device)
+  n = len(env_ids)
+  lo, hi = (math.radians(x) for x in tilt_range_deg)
+  tilt = lo + (hi - lo) * torch.rand(n, device=env.device)
+
+  if getattr(env, "_platform_tilt", None) is None:
+    env._platform_tilt = torch.zeros(env.num_envs, device=env.device)
+  env._platform_tilt[env_ids] = tilt
+
+  body, quat, _, _ = _platform_pose(tilt)
+  asset: Entity = env.scene[asset_cfg.name]
+  asset.write_mocap_pose_to_sim(
+    torch.cat((body, quat), dim=-1), env_ids=env_ids
+  )
+  env._pad_pose_cache = None
+
+
 def _dr_events() -> dict[str, EventTermCfg]:
   """Startup / reset randomization.
 
-  `reset_base` is always present: the spawn ring belongs to the task, not to
-  the aircraft, so it does not scale with `_DR_SCALE`. Everything below it is
-  empty when `_DR_SCALE` is 0.
+  `reset_base` and `reset_tower_tilt` are always present: the spawn ring and
+  the platform pose belong to the task, not to the aircraft, so they do not
+  scale with `_DR_SCALE`. Everything below them is empty when `_DR_SCALE` is 0.
   """
   events: dict[str, EventTermCfg] = {
     "reset_base": EventTermCfg(
@@ -1202,6 +1165,13 @@ def _dr_events() -> dict[str, EventTermCfg]:
         "spin_abs": _SPAWN_SPIN_ABS,
         "asset_cfg": _DRONE_CFG,
       },
+    ),
+    # The tower tilt is a task property, not plant randomization: it stays on
+    # in play mode, where the policy is evaluated on the same angle range.
+    "reset_tower_tilt": EventTermCfg(
+      func=_reset_tower_tilt,
+      mode="reset",
+      params={"tilt_range_deg": _TILT_RANGE_DEG},
     ),
     # Sensor error is per episode, not per step, so it is drawn here rather
     # than by the noise pipeline (which has no reset hook of its own).
@@ -1397,6 +1367,209 @@ def speed_penalty(
   asset: Entity = env.scene[asset_cfg.name]
   speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
   return -torch.clamp(speed, max=20.0)
+
+
+def landing_speed_penalty(
+  env: ManagerBasedRlEnv,
+  speed_tol: float = _LANDING_SPEED_TOL,
+  sensor_name: str = "drone_platform_contact",
+  asset_cfg: SceneEntityCfg = _DRONE_CFG,
+) -> torch.Tensor:
+  """Penalty for touching or sliding on the pad faster than ``speed_tol``.
+
+  Zero everywhere except while the drone is resting on the platform, so this
+  shapes the landing without competing with the approach. The penalty is
+  linear in the excess, so a 2 m/s touchdown costs four times a 1 m/s one, and
+  landing below the tolerance costs nothing at all.
+
+  Uses the same contact test as the ``success`` term, so "on the pad" means
+  the same thing to both.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
+  excess = (speed - speed_tol).clamp_min(0.0)
+  return -excess * _platform_contact(env, sensor_name).to(excess.dtype)
+
+
+class _ImpactLatch:
+  """Remembers the approach speed at the first touchdown of an episode.
+
+  The speed at the contact step is already post-impulse: MuJoCo resolves the
+  contact inside the ten 2 ms substeps of the control step, so by the time a
+  reward term reads ``root_link_lin_vel_w`` the descent has been arrested. The
+  number that matters is the last sample while still airborne, which is what
+  this keeps.
+
+  Caveat: that sample can be up to one control step (20 ms) before the impact,
+  and in free fall that is ~0.2 m/s of lead. Treat it as an *approach* speed
+  and keep the thresholds well clear of the noise.
+  """
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    self._memory = torch.zeros(env.num_envs, device=env.device)
+    self._impact = torch.zeros(env.num_envs, device=env.device)
+    self._latched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    self._seen_air = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    self._prev_contact = torch.zeros(
+      env.num_envs, dtype=torch.bool, device=env.device
+    )
+
+  @property
+  def latched(self) -> torch.Tensor:
+    return self._latched
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    ids = slice(None) if env_ids is None else env_ids
+    self._memory[ids] = 0.0
+    self._impact[ids] = 0.0
+    self._latched[ids] = False
+    self._seen_air[ids] = False
+    self._prev_contact[ids] = False
+
+  def update(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    contact = _platform_contact(env, "drone_platform_contact")
+    asset: Entity = env.scene[_DRONE_CFG.name]
+    speed = torch.norm(asset.data.root_link_lin_vel_w, dim=-1)
+
+    # On the step contact appears, `contact` is True, so the memory still holds
+    # the speed from the last airborne sample -- exactly what we want. Latch
+    # only the first touchdown: a bouncing landing must not overwrite it with
+    # the gentler speed of a later touch.
+    self._memory = torch.where(contact, self._memory, speed)
+    self._seen_air = self._seen_air | ~contact
+    rising = contact & ~self._prev_contact & ~self._latched
+    # If contact is already present on the very first step (possible after a
+    # hand-placed reset) there is no airborne sample to use. Latch infinity, not
+    # the post-impulse speed: an unknown impact must not pay a bonus.
+    impact = torch.where(
+      self._seen_air, self._memory, torch.full_like(speed, float("inf"))
+    )
+    self._impact = torch.where(rising, impact, self._impact)
+    self._latched = self._latched | rising
+    self._prev_contact = contact
+    return self._impact
+
+
+class LandingImpactBonus:
+  """One-shot bonus at success, scaled by approach speed and route quality.
+
+  A bonus rather than a penalty on purpose: it cannot be collected by not
+  landing, so the "hover and wait" basin that every penalty version fell into
+  does not exist here. The route gate stops a soft but sloppy approach from
+  earning more than a straight one (the 2000-run's failure mode, §I.47).
+  """
+
+  def __init__(self, cfg: Any, env: ManagerBasedRlEnv) -> None:
+    del cfg  # thresholds are module constants
+    self._latch = _ImpactLatch(env)
+    self._route = _PathTracker(env)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._latch.reset(env_ids)
+    self._route.reset(env_ids)
+
+  def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    impact = self._latch.update(env)
+    eff = self._route.update(env)
+    span = _SOFT_IMPACT_FAST - _SOFT_IMPACT_SLOW
+    quality = ((_SOFT_IMPACT_FAST - impact) / span).clamp(0.0, 1.0)
+    gate_span = _SOFT_ROUTE_HIGH - _SOFT_ROUTE_LOW
+    gate = ((eff - _SOFT_ROUTE_LOW) / gate_span).clamp(0.0, 1.0)
+    zeros = torch.zeros_like(quality)
+    return torch.where(_at_goal(env), quality * gate, zeros)
+
+
+class LandingImpactMetric:
+  """Logs the latched approach speed of the first touchdown (0 if none).
+
+  Reduced with "max" in the metrics dict, so an episode that never touches
+  reports 0 and a real landing reports its impact speed.
+  """
+
+  def __init__(self, cfg: Any, env: ManagerBasedRlEnv) -> None:
+    del cfg
+    self._latch = _ImpactLatch(env)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._latch.reset(env_ids)
+
+  def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    impact = self._latch.update(env)
+    return torch.where(self._latch.latched, impact, torch.zeros_like(impact))
+
+
+class _PathTracker:
+  """Accumulates the arc length flown since the episode started.
+
+  The first sample after a reset records the origin distance and contributes
+  no movement, so this reads the pose in `update` rather than in `reset`: the
+  reset hook can run before the spawn event has written the new pose.
+  """
+
+  def __init__(self, env: ManagerBasedRlEnv) -> None:
+    self._prev = torch.zeros(env.num_envs, 3, device=env.device)
+    self._start = torch.zeros(env.num_envs, device=env.device)
+    self._path = torch.zeros(env.num_envs, device=env.device)
+    self._fresh = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    ids = slice(None) if env_ids is None else env_ids
+    self._fresh[ids] = True
+
+  def update(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    pos = env.scene[_DRONE_CFG.name].data.root_link_pos_w
+    first = self._fresh
+    step = torch.norm(pos - self._prev, dim=-1)
+    self._path = torch.where(
+      first, torch.zeros_like(self._path), self._path + step
+    )
+    self._start = torch.where(
+      first, torch.norm(pos - _target_tensor(env), dim=-1), self._start
+    )
+    # Clone: `pos` may be a view into a buffer that the next physics step
+    # overwrites in place.
+    self._prev = pos.clone()
+    self._fresh = torch.zeros_like(first)
+    eff = self._start / self._path.clamp_min(1e-6)
+    return eff.clamp(max=1.0)
+
+
+class PathEfficiencyBonus:
+  """One-shot bonus at success for flying the direct line.
+
+  Terminal on purpose: it never enters the per-step sum, so it cannot touch
+  the ``alive >= distance`` floor, make dying attractive, or create a hover
+  basin. It also cannot be collected without landing.
+  """
+
+  def __init__(self, cfg: Any, env: ManagerBasedRlEnv) -> None:
+    del cfg  # thresholds are module constants
+    self._tracker = _PathTracker(env)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._tracker.reset(env_ids)
+
+  def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    eff = self._tracker.update(env)
+    span = _PATH_EFF_HIGH - _PATH_EFF_LOW
+    quality = ((eff - _PATH_EFF_LOW) / span).clamp(0.0, 1.0)
+    zeros = torch.zeros_like(quality)
+    return torch.where(_at_goal(env), quality, zeros)
+
+
+class PathEfficiencyMetric:
+  """Logs the route efficiency of a successful episode (0 if it never lands)."""
+
+  def __init__(self, cfg: Any, env: ManagerBasedRlEnv) -> None:
+    del cfg
+    self._tracker = _PathTracker(env)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    self._tracker.reset(env_ids)
+
+  def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    eff = self._tracker.update(env)
+    return torch.where(_at_goal(env), eff, torch.zeros_like(eff))
 
 
 def closing_speed(
@@ -1725,6 +1898,15 @@ def _make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       func=distance_penalty, weight=_REWARD_DISTANCE
     ),
     "speed": RewardTermCfg(func=speed_penalty, weight=_REWARD_SPEED),
+    "landing_speed": RewardTermCfg(
+      func=landing_speed_penalty, weight=_PENALTY_LANDING_SPEED
+    ),
+    "landing_soft": RewardTermCfg(
+      func=LandingImpactBonus, weight=_REWARD_SOFT_IMPACT
+    ),
+    "path_efficiency": RewardTermCfg(
+      func=PathEfficiencyBonus, weight=_REWARD_PATH
+    ),
     "closing": RewardTermCfg(func=closing_speed, weight=_REWARD_CLOSING),
     "rate": RewardTermCfg(func=rate_penalty, weight=_REWARD_RATE),
     "alive": RewardTermCfg(func=alive_bonus, weight=_REWARD_ALIVE),
@@ -1737,6 +1919,15 @@ def _make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     "runaway": RewardTermCfg(func=runaway_penalty, weight=_PENALTY_RUNAWAY),
     "timeout": RewardTermCfg(func=timeout_penalty, weight=_PENALTY_TIMEOUT),
     "success": RewardTermCfg(func=success_bonus, weight=_REWARD_SUCCESS),
+  }
+
+  metrics = {
+    "impact_speed": MetricsTermCfg(
+      func=LandingImpactMetric, reduce="max"
+    ),
+    "path_efficiency": MetricsTermCfg(
+      func=PathEfficiencyMetric, reduce="max"
+    ),
   }
 
   terminations = {
@@ -1764,6 +1955,7 @@ def _make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     actions=actions,
     events=_dr_events(),
     rewards=rewards,
+    metrics=metrics,
     terminations=terminations,
     viewer=ViewerConfig(
       origin_type=ViewerConfig.OriginType.ASSET_BODY,
@@ -1791,10 +1983,14 @@ def drone_tilted_landing_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.observations["actor"].enable_corruption = False
     # Domain randomization must never leak into an evaluation: no randomized
     # body and no randomized actuation. The nominal motor lag and transport
-    # delay stay on -- the policy is trained with them. The spawn stays
-    # randomized, because an evaluation should show the policy on fresh
-    # bearings. The episode keeps its training length (10 s).
-    cfg.events = {"reset_base": cfg.events["reset_base"]}
+    # delay stay on -- the policy is trained with them. The spawn and the tower
+    # tilt stay randomized, because an evaluation should show the policy on
+    # fresh bearings and fresh slopes. The episode keeps its training length
+    # (10 s).
+    cfg.events = {
+      "reset_base": cfg.events["reset_base"],
+      "reset_tower_tilt": cfg.events["reset_tower_tilt"],
+    }
     if _PLANT == "arx":
       arx_cfg = cfg.actions["arx"]
       assert isinstance(arx_cfg, ArxActionCfg)
